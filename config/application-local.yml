@@ -1,0 +1,12 @@
+# Profile "local": the gateway on a developer machine, with upstreams on localhost.
+# Spring Boot reads ./config/application-<profile>.yml from the working directory, so this file never
+# ships inside the jar. Activate it from the repository root:
+#   SPRING_PROFILES_ACTIVE=local ./mvnw spring-boot:run      (or ./scripts/stack.sh demo up)
+gateway:
+  # Local upstreams are localhost:<port>; the default (false) refuses loopback upstreams (SSRF guard).
+  allow-loopback-upstreams: true
+  rbac:
+    users:
+      ops:
+        # user "ops" logs in with key "local-ops-key" (this is its SHA-256); local only
+        key-sha256: ${GATEWAY_OPS_KEY_SHA256:1d93d8aa6bb02cfaf47c6b57d9c45c7092ab3ae2752bd3549c71afeae9879485}

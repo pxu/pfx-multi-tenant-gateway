@@ -2,20 +2,20 @@
 # The gateway in front of real upstreams (upstream-app: echo, delays, status codes, injected failures):
 # a stable and a canary (60% of its requests fail), on DigitalOcean App Platform or locally.
 #
-#   docker compose -f upstream-app/docker-compose.yml up -d --build        # gateway + both upstreams, locally
+#   ./scripts/stack.sh upstream-demo up       # gateway + both upstreams, locally (Spring Boot processes)
 #   ./scripts/demo-do-upstream.sh
 #
 #   STABLE_URL=https://gw-upstream-stable-....ondigitalocean.app \
 #   CANARY_URL=https://gw-upstream-canary-....ondigitalocean.app ./scripts/demo-do-upstream.sh
 #
 # Env: GATEWAY [http://localhost:9180], MANAGEMENT [http://localhost:9181],
-#      STABLE_URL [http://stable:8080], CANARY_URL [http://canary:8080] (as the gateway reaches them)
+#      STABLE_URL [http://localhost:9201], CANARY_URL [http://localhost:9202] (as the gateway reaches them)
 set -euo pipefail
 
 G="${GATEWAY:-http://localhost:9180}"
 M="${MANAGEMENT:-http://localhost:9181}"
-STABLE="${STABLE_URL:-http://stable:8080}"
-CANARY="${CANARY_URL:-http://canary:8080}"
+STABLE="${STABLE_URL:-http://localhost:9201}"
+CANARY="${CANARY_URL:-http://localhost:9202}"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 json() { python3 -c "import sys, json; print(json.load(sys.stdin)$1)"; }
