@@ -15,6 +15,3 @@ data/
 # of 0.2-0.7 GB, target files with bearer tokens, per-step reports, plots) stays on the machine that ran it
 loadtest-results/*
 !loadtest-results/REPORT.md
-
-# local stacks (scripts/stack.sh): logs and pid files
-.run/
