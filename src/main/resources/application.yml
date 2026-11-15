@@ -1,0 +1,106 @@
+spring:
+  application:
+    name: multi-tenant-api-gateway
+  threads:
+    virtual:
+      enabled: true          # one virtual thread per request (Go analogy: one goroutine per request)
+  # Configuration source of truth. Any JDBC database: change the URL (and add its driver), and provide
+  # schema-<platform>.sql. Default: embedded H2 in a file, so data survives a restart of the demo.
+  datasource:
+    url: ${GATEWAY_DB_URL:jdbc:h2:file:./data/gateway}
+    username: ${GATEWAY_DB_USER:sa}
+    password: ${GATEWAY_DB_PASSWORD:}
+    hikari:
+      connection-timeout: 2000   # ms (default 30000): a request missing the cache would wait that long for a dead database
+  sql:
+    init:
+      mode: always           # create missing tables at startup (CREATE TABLE IF NOT EXISTS)
+      platform: ${GATEWAY_DB_PLATFORM:h2}   # runs schema-<platform>.sql
+  mvc:
+    formcontent:
+      filter:
+        enabled: false       # never parse request bodies: the proxy streams them untouched
+  web:
+    resources:
+      add-mappings: false    # no static resources; every path belongs to the router
+
+server:
+  port: 8080
+  shutdown: graceful         # finish in-flight requests on SIGTERM
+
+management:
+  server:
+    port: 8081               # health and metrics on a separate port, not exposed with the data plane
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true        # /actuator/health/liveness and /readiness
+
+gateway:
+  rbac:                        # user -> roles, role -> permissions; one role per login
+    session-ttl: 1h
+    roles:                     # built-in (read-only); custom roles are created through /admin/rbac/roles
+      viewer: [tenants:read, routes:read, rbac:read]
+      operator: [tenants:read, tenants:write, routes:read, routes:write]
+      admin: [tenants:read, tenants:write, tokens:issue, tokens:revoke, routes:read, routes:write, rbac:read, rbac:write]
+      # data-plane roles: <service>:<action>, action from the HTTP method (GET read, DELETE delete, else write)
+      orders-reader: [orders:read]
+      orders-writer: [orders:read, orders:write, orders:delete]
+    users:                     # operators of the management API; never permissions here, only roles
+      ops:                     # bootstrap user; add more as needed
+        key-sha256: ${GATEWAY_OPS_KEY_SHA256:}     # hex SHA-256 of the key; blank = cannot log in
+        roles: [admin, viewer]
+  audit-queue-capacity: 10000  # async audit buffer; full -> entries dropped and counted
+  retry:                       # idempotent requests without a body (GET/HEAD/OPTIONS), connect failure or timeout only
+    max-attempts: 2            # attempts in total: one retry
+    base-backoff: 50ms         # full jitter: wait random(0, min(max, base * 2^n))
+    max-backoff: 1s
+    budget-ratio: 0.1          # retries <= ~10% of requests: no retry storms
+    budget-reserve: 10
+  tenant-max-concurrent-requests: 50  # bulkhead: a tenant's requests in flight at once (Tenant.maxConcurrentRequests overrides)
+  ip-rate-limit:                # per client address, before authentication: generous (an office shares one IP)
+    requests-per-minute: 1200
+    burst: 100
+  trusted-proxies: []          # load balancers whose X-Forwarded-For is believed (IPs or CIDRs); none = TCP peer only
+  continue-client-traces: true # join the client's W3C traceparent; false = every request starts a new trace here
+  rate-limit-fail-open: true   # rate limiter failing (or its breaker open): serve without limits (true) or 503 (false)
+  config-refresh-interval: 5s  # max delay before a change made through another instance applies here
+  tenant-cache-ttl: 5s         # tenants load on demand (single flight); cached this long per instance
+  upstream-timeout: 10s
+  max-request-body: 10MB
+  allow-loopback-upstreams: false  # routes may not point at the gateway host itself
+  proxy:
+    connect-timeout: 2s
+    pool-lease-timeout: 500ms        # wait this long for a free pooled connection, then 503
+    max-total-connections: 500
+    max-connections-per-route: 100   # per upstream host:port
+    idle-timeout: 60s                # not aggressive: see UpstreamProxy (TIME_WAIT / port exhaustion)
+    validate-after-inactivity: 2s    # check a connection idle longer than this before reusing it
+  circuit-breaker:           # one per upstream host:port
+    failure-rate-threshold: 50
+    minimum-calls: 10
+    sliding-window-size: 20
+    open-duration: 10s
+    half-open-max-probes: 3
+  config-db-circuit-breaker:   # around the config database reads on the request path (tenants, token revocations)
+    failure-rate-threshold: 50
+    minimum-calls: 5
+    sliding-window-size: 10
+    open-duration: 5s
+    half-open-max-probes: 1
+  rate-limit-circuit-breaker:  # around the rate limiter (CircuitBreakingRateLimiter), whatever its store
+    failure-rate-threshold: 50
+    minimum-calls: 5
+    sliding-window-size: 10
+    open-duration: 5s
+    half-open-max-probes: 1
+  jwt:
+    issuer: multi-tenant-api-gateway
+    audience: gateway-tenants
+    default-ttl: 15m
+    max-ttl: 1h              # bounds the damage of a leaked token
+    private-key-pem: ${GATEWAY_JWT_PRIVATE_KEY:}

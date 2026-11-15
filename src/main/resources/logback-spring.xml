@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/base.xml"/>
+
+    <!-- Audit events are already JSON: print them as-is, one per line, so a log shipper can route
+         lines from the AUDIT logger to the audit store without parsing the application log format. -->
+    <appender name="AUDIT_STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="AUDIT" level="INFO" additivity="false">
+        <appender-ref ref="AUDIT_STDOUT"/>
+    </logger>
+</configuration>

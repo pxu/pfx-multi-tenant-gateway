@@ -1,0 +1,77 @@
+# Prometheus recording and alerting rules for the gateway.
+#   promtool check rules ops/prometheus/gateway-rules.yml
+#
+# SLI: the share of requests answered with a 5xx (rejections such as 401/403/429 are the gateway doing
+# its job, not errors). SLO: 99.9% over 30 days, i.e. an error budget of 0.1%.
+# Burn-rate alerts follow the Google SRE Workbook (multi-window, multi-burn-rate): page when the budget
+# burns 14.4x too fast (2% of the month's budget in an hour), open a ticket at 6x (5% in six hours).
+# The short window makes an alert stop soon after the burn stops.
+groups:
+  - name: gateway-slo-recording
+    rules:
+      - record: gateway:request_errors:ratio_rate5m
+        expr: sum(rate(gateway_requests_seconds_count{status="5xx"}[5m])) / sum(rate(gateway_requests_seconds_count[5m]))
+      - record: gateway:request_errors:ratio_rate30m
+        expr: sum(rate(gateway_requests_seconds_count{status="5xx"}[30m])) / sum(rate(gateway_requests_seconds_count[30m]))
+      - record: gateway:request_errors:ratio_rate1h
+        expr: sum(rate(gateway_requests_seconds_count{status="5xx"}[1h])) / sum(rate(gateway_requests_seconds_count[1h]))
+      - record: gateway:request_errors:ratio_rate6h
+        expr: sum(rate(gateway_requests_seconds_count{status="5xx"}[6h])) / sum(rate(gateway_requests_seconds_count[6h]))
+
+  - name: gateway-slo-alerts
+    rules:
+      - alert: GatewayErrorBudgetFastBurn
+        expr: gateway:request_errors:ratio_rate1h > (14.4 * 0.001) and gateway:request_errors:ratio_rate5m > (14.4 * 0.001)
+        labels: {severity: page}
+        annotations:
+          summary: "5xx rate is burning the 30-day error budget 14.4x too fast (2% of it per hour)"
+      - alert: GatewayErrorBudgetSlowBurn
+        expr: gateway:request_errors:ratio_rate6h > (6 * 0.001) and gateway:request_errors:ratio_rate30m > (6 * 0.001)
+        labels: {severity: ticket}
+        annotations:
+          summary: "5xx rate is burning the 30-day error budget 6x too fast (5% of it per six hours)"
+      - alert: GatewayLatencyP99High
+        expr: histogram_quantile(0.99, sum by (le) (rate(gateway_requests_seconds_bucket{decision="ALLOW"}[5m]))) > 1
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "p99 latency of forwarded requests above 1s"
+
+  - name: gateway-saturation
+    rules:
+      - alert: GatewayCircuitOpen
+        expr: gateway_circuit_state == 1
+        for: 1m
+        labels: {severity: ticket}
+        annotations:
+          summary: "circuit breaker {{ $labels.name }} has been open for a minute"
+      - alert: GatewayUpstreamPoolSaturated
+        expr: max(httpcomponents_httpclient_pool_total_pending) > 0
+        for: 2m
+        labels: {severity: ticket}
+        annotations:
+          summary: "requests are waiting for an upstream connection (503 UPSTREAM_SATURATED next)"
+      # The port-exhaustion outage: connections opened per forwarded request. Near 0 = reused; near 1 =
+      # a new connection (and later a local port in TIME_WAIT for ~60s) per request.
+      - alert: GatewayUpstreamConnectionChurn
+        expr: sum(rate(gateway_upstream_connections_opened_total[10m])) / sum(rate(gateway_requests_seconds_count{decision="ALLOW"}[10m])) > 0.5
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "over half the forwarded requests open a new upstream connection: check idle timeouts and keep-alive"
+      - alert: GatewayRetryBudgetExhausted
+        expr: sum(increase(gateway_upstream_retries_denied_total[5m])) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "retries are being refused: upstream failures are widespread"
+      # Revocation checks fail open: while this fires, a revoked token this instance never checked is served.
+      - alert: GatewayRevocationCheckUnavailable
+        expr: increase(gateway_auth_revocation_unavailable_total[5m]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "token revocation could not be checked (config database unreachable); tokens served unchecked"
+      - alert: GatewayAuditEntriesDropped
+        expr: increase(gateway_audit_dropped_total[5m]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "the audit queue is full and entries are being dropped"

@@ -1,0 +1,17 @@
+target/
+.idea/
+*.iml
+.vscode/
+.DS_Store
+*.log
+
+# local secrets
+.env
+*.pem
+
+# embedded H2 database (local runs)
+data/
+# load-test results: only the report is kept in the repository; each run's directory (raw vegeta results
+# of 0.2-0.7 GB, target files with bearer tokens, per-step reports, plots) stays on the machine that ran it
+loadtest-results/*
+!loadtest-results/REPORT.md

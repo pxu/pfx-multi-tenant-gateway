@@ -1,0 +1,26 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:gateway-it;DB_CLOSE_DELAY=-1   # in memory: every test JVM starts empty
+gateway:
+  ip-rate-limit:
+    requests-per-minute: 0   # off: every test request comes from 127.0.0.1 (IpRateLimitIT turns it on)
+  rbac:
+    users:
+      ops:
+        key-sha256: 24e29f6f9b06174f48d833c5cd2db2966eea8e5edacb80e365e81388e8277fdc   # test-ops-key
+        roles: [admin, viewer]
+      vera:
+        key-sha256: 094988c653f9013298e658aea601804249ecd718b00e8b4e5b0974417425beee   # test-vera-key
+        roles: [viewer, operator]
+  upstream-timeout: 500ms
+  max-request-body: 1KB
+  allow-loopback-upstreams: true   # WireMock runs on localhost
+  circuit-breaker:
+    failure-rate-threshold: 50
+    minimum-calls: 4
+    sliding-window-size: 4
+    open-duration: 1s
+    half-open-max-probes: 1
+  proxy:
+    max-connections-per-route: 2   # small, so the saturation test can fill the pool
+    pool-lease-timeout: 100ms

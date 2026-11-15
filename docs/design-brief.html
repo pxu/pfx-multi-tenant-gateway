@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Multi-Tenant API Gateway: Design Brief</title>
+<style>
+  @page { size: A4; margin: 14mm 13mm 14mm 13mm; }
+  :root {
+    --blue: #2563eb; --blue-bg: #e8f0fe; --green: #15803d; --green-bg: #e7f6ec;
+    --red: #c62828; --red-bg: #fdecec; --amber: #b45309; --amber-bg: #fff4e0;
+    --ink: #1f2937; --muted: #6b7280; --line: #d9dee7; --navy: #0b1f4d;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--ink); font-size: 9.8pt;
+         line-height: 1.5; margin: 0; background: #fff; }
+  h1 { font-size: 22pt; margin: 0 0 4px; color: var(--navy); }
+  h2 { font-size: 15pt; color: var(--navy); border-bottom: 3px solid var(--blue); padding-bottom: 4px;
+       margin: 0 0 10px; break-before: page; }
+  h3 { font-size: 11.5pt; color: var(--blue); margin: 14px 0 5px; break-after: avoid-page; }
+  p { margin: 5px 0; }
+  code { font-family: "SF Mono", Menlo, monospace; font-size: 8.3pt; background: #f3f4f6; padding: 0 3px; border-radius: 3px; }
+  table { width: 100%; border-collapse: collapse; margin: 6px 0 10px; font-size: 8.6pt; }
+  th { background: var(--navy); color: #fff; text-align: left; padding: 4px 6px; font-weight: 600; }
+  th code { background: rgba(255,255,255,0.18); color: #fff; }
+  td { border-bottom: 1px solid var(--line); padding: 4px 6px; vertical-align: top; }
+  tr { break-inside: avoid; }
+  tr:nth-child(even) td { background: #f8fafc; }
+  table.catalogue { table-layout: fixed; }
+  table.catalogue code, table.checks code { word-break: break-word; }
+  td.grp { background: var(--blue-bg) !important; color: var(--navy); font-weight: 700; }
+  .figure { break-inside: avoid; margin: 8px 0 12px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fcfdff; }
+  .figure .cap { font-size: 8.4pt; color: var(--muted); text-align: center; margin-top: 4px; }
+  .figure svg { max-height: 205mm !important; }
+  .figure.mid svg { max-height: 120mm !important; width: auto !important; }
+  .callout { border-left: 4px solid var(--blue); background: var(--blue-bg); padding: 7px 11px; border-radius: 4px; margin: 8px 0; break-inside: avoid; }
+  .callout.ok { border-color: var(--green); background: var(--green-bg); }
+  .callout.warn { border-color: var(--amber); background: var(--amber-bg); }
+  .meta td:first-child { width: 26%; font-weight: 600; }
+  .mermaid { text-align: center; }
+  .small { font-size: 8.4pt; color: var(--muted); }
+  ol.steps { margin: 4px 0 8px 18px; padding: 0; }
+  ol.steps li { margin: 2px 0; }
+</style>
+</head>
+<body>
+
+<h1>Multi-Tenant API Gateway</h1>
+<p style="font-size:12pt;color:var(--muted);margin-top:0">Design brief: the architecture (every component) and the end-to-end workflow</p>
+
+<table class="meta">
+  <tr><td>What it is</td><td>A reverse proxy in front of many backend services, shared by many tenants. Every request is authenticated, checked against the tenant's policy, routed at runtime, proxied with resilience controls and audited exactly once.</td></tr>
+  <tr><td>Stack</td><td>Java 21 · Spring Boot 3.5 (Spring MVC on virtual threads) · Apache HttpClient 5 (pooled) · Caffeine · JDBC + H2 (portable SQL) · Nimbus JOSE (RS256 JWT). No Redis, no message broker.</td></tr>
+  <tr><td>Code</td><td>branch <code>feature/GW-3-in-memory-demo</code>, step 32 (<code>bf9269c</code>); 45 main classes; 152 unit + 62 integration tests, line coverage gate 80%</td></tr>
+  <tr><td>How to read this</td><td>Part 1 is the map: what each component does and why. Part 2 follows one request (and one admin change) from start to finish. Every row names the class and the test to open for a deep dive.</td></tr>
+</table>
+
+<h3>Design principles (they explain most decisions below)</h3>
+<table>
+  <tr><th style="width:30%">Principle</th><th>What it means in the code</th></tr>
+  <tr><td><b>Reject = throw</b></td><td>Every stage passes or throws <code>GatewayException(code)</code>. Rendering to RFC 9457 problem+json happens in one place. A rejected request cannot reach an upstream: the structure guarantees it, not a convention.</td></tr>
+  <tr><td><b>Exactly one audit entry per request</b></td><td>The outermost filter creates the record and writes it in <code>finally</code>; later stages only fill in fields.</td></tr>
+  <tr><td><b>Canonicalise the path once</b></td><td>Routing, allowlist and forwarding all use the same canonical path; ambiguous paths (<code>..</code>, encoded slashes) are a 400.</td></tr>
+  <tr><td><b>No I/O per request on the hot path</b></td><td>Routes, RBAC data and rate-limit buckets are in memory. Tenants and token revocations are read from the database at most once per 5s per instance, through a single flight and a circuit breaker.</td></tr>
+  <tr><td><b>Cheap checks first, shared resources last</b></td><td>Quota is spent only after path, scope and permission pass; the route's shared bucket after the tenant's own quota.</td></tr>
+  <tr><td><b>Static stability</b></td><td>If the config database is down, the gateway keeps serving from its last snapshot and cached tenants; it never replaces good config with an empty one.</td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2>Part 1. Architecture design</h2>
+
+<h3>1.1 System context</h3>
+<div class="figure mid">
+<pre class="mermaid">
+flowchart LR
+  C(["Tenant clients<br/>Bearer JWT"]) -- ":8080" --> F
+  OP(["Operators<br/>session token"]) -- ":8080 /admin/**" --> F
+  subgraph GW["Gateway instance (stateless; N behind a load balancer)"]
+    direction TB
+    F["Filters<br/>audit · per-IP limit · auth"] --> PC["ProxyController<br/>tenant · route · policy · bulkhead"]
+    PC --> UP["UpstreamProxy<br/>pooled HTTP client"]
+    PC --- MEM[("In memory<br/>route + RBAC snapshot<br/>token buckets · breakers<br/>tenant / revocation cache")]
+    ACT["Actuator :8081<br/>metrics · probes"]
+  end
+  UP --> S1["orders service"]
+  UP --> S2["billing service"]
+  UP --> S3["canary / stable variants"]
+  MEM <-- "JDBC: load on miss,<br/>poll version" --> DB[("Config database<br/>H2 file (demo) / Postgres")]
+  F -- "audit lines (async)" --> LOG[["stdout → log shipper"]]
+  PR[["Prometheus<br/>+ alert rules"]] -- scrape --> ACT
+</pre>
+<div class="cap">Figure 1. The gateway, its dependencies and its trust boundaries (clients and operators untrusted; upstreams trust only headers the gateway sets)</div>
+</div>
+
+<h3>1.2 Components and how they connect</h3>
+<div class="figure">
+<pre class="mermaid">
+flowchart TB
+  subgraph EDGE["Edge filters (in order)"]
+    AF["AuditFilter (1)<br/>request id · ClientIpResolver<br/>TraceContext · Paths.normalize"]
+    IP["IpRateLimitFilter (2)<br/>before authentication"]
+    AUF["AuthFilter (3)<br/>TokenService · SessionService<br/>revocation check"]
+    AF --> IP --> AUF
+  end
+  subgraph CP["Control plane (/admin/**)"]
+    PI["PermissionInterceptor<br/>@RequiresPermission"]
+    AC["AdminController<br/>tenants · routes · tokens"]
+    RC["RbacController<br/>roles · tenant users"]
+    UV["UpstreamUrlValidator<br/>SSRF"]
+    PI --> AC & RC
+    AC --> UV
+  end
+  subgraph DP["Data plane"]
+    PX["ProxyController<br/>numbered steps"]
+    PE["PolicyEngine<br/>allowlist · scope · RBAC · quotas"]
+    BH["ConcurrencyLimiter<br/>bulkhead per tenant"]
+    PICK["AliasTable (weighted)<br/>RendezvousHash (sticky)"]
+    CB["CircuitBreaker<br/>per upstream host:port"]
+    RT["RetryBudget · Backoff<br/>retries + hedging"]
+    UPX["UpstreamProxy<br/>HC5 pool · header rules"]
+    PX --> PE --> BH --> PICK --> CB --> RT --> UPX
+  end
+  subgraph SH["Shared services"]
+    RBAC["rbac: Authorizer<br/>RbacAuthorizer"]
+    RL["RateLimiter → CircuitBreakingRateLimiter<br/>→ InMemoryRateLimiter (Caffeine)"]
+    CS["ConfigStore<br/>snapshot · SingleFlightCache<br/>config-db breaker"]
+    REPO["ConfigRepository<br/>JdbcConfigRepository"]
+    AS["AsyncAuditSink<br/>bounded queue"]
+    CS --> REPO
+  end
+  AUF --> PX
+  AUF --> PI
+  IP --> RL
+  PE --> RL
+  PE --> RBAC
+  PX --> CS
+  AUF --> CS
+  AC & RC --> CS
+  RBAC --> CS
+  AF --> AS
+  REPO --> DB[("config database")]
+  UPX --> UPS["upstream services"]
+</pre>
+<div class="cap">Figure 2. Every component and its dependencies. Plain classes are wired in <code>GatewayConfig</code> so each can be unit-tested on its own.</div>
+</div>
+
+<h3>1.3 Component catalogue</h3>
+<table class="catalogue">
+  <tr><th style="width:19%">Component</th><th style="width:36%">Responsibility</th><th style="width:24%">Key decision</th><th style="width:21%">Dive deep</th></tr>
+  <tr><td class="grp" colspan="4">Edge filters</td></tr>
+  <tr><td><code>AuditFilter</code></td><td>Creates the <code>AuditRecord</code> and request id, resolves the client address, joins or starts the trace, canonicalises the path; catches every exception thrown in filters and renders it; writes one audit entry and the request timer in <code>finally</code>.</td><td>One place for error rendering and auditing; filters' exceptions never reach Spring's advice.</td><td><code>GatewayIT</code> (<code>assertRejected</code>)</td></tr>
+  <tr><td><code>ClientIpResolver</code></td><td>Client address = TCP peer, unless the peer is a trusted proxy; then <code>X-Forwarded-For</code> walked from the right.</td><td>A client-written header proves nothing; IP literals only, no DNS.</td><td><code>ClientIpResolverTest</code></td></tr>
+  <tr><td><code>TraceContext</code></td><td>W3C <code>traceparent</code>: joins a valid one or starts a trace; a child span id per upstream call.</td><td>No tracing library; ids match what an OTel exporter would use.</td><td><code>TraceContextTest</code></td></tr>
+  <tr><td><code>IpRateLimitFilter</code></td><td>Per-address token bucket (<code>ip:</code>), before authentication.</td><td>Junk-token floods and login guessing stop before signature checks.</td><td><code>IpRateLimitIT</code></td></tr>
+  <tr><td><code>AuthFilter</code></td><td><code>/admin/**</code>: RBAC session token. Other paths: tenant JWT, then the revocation check.</td><td>Two trust domains; tenant tokens never work on the admin API and vice versa.</td><td><code>GatewayIT</code>, <code>SessionServiceTest</code></td></tr>
+
+  <tr><td class="grp" colspan="4">Identity and access</td></tr>
+  <tr><td><code>TokenService</code></td><td>Issues and verifies RS256 tenant JWTs: <code>tid</code>, <code>sub</code>, <code>role</code>, <code>scope</code>, <code>jti</code>; TTL ≤ 1h.</td><td>Key selector accepts RS256 only (no <code>alg:none</code>, no HS256 confusion); verified locally.</td><td><code>TokenServiceTest</code></td></tr>
+  <tr><td><code>SessionService</code></td><td><code>POST /admin/login {user,key,role}</code> → session JWT with one role; re-checks the role on every request.</td><td>One active role per login; keys stored as SHA-256.</td><td><code>SessionServiceTest</code></td></tr>
+  <tr><td><code>PermissionInterceptor</code></td><td>Checks the handler's <code>@RequiresPermission</code>; no annotation = 403.</td><td>Deny by default; a test checks every endpoint is annotated.</td><td><code>AdminControllerPermissionsTest</code></td></tr>
+  <tr><td><code>rbac/*</code> (<code>Authorizer</code>, <code>RbacAuthorizer</code>, <code>Permission</code>, <code>Subject</code>)</td><td>The decision point for both planes: user → roles → <code>resource:action</code> permissions. Built-in roles (config, read-only) + custom roles (database).</td><td>Scope = which service; role = which action (from the HTTP method). Boundary enforced by a test.</td><td><code>RbacAuthorizerTest</code>, <code>RbacBoundaryTest</code></td></tr>
+
+  <tr><td class="grp" colspan="4">Data plane and traffic control</td></tr>
+  <tr><td><code>ProxyController</code></td><td>The whole data plane as numbered steps: tenant → route → body size → policy → bulkhead → attempts (pick, breaker, proxy, retry or hedge).</td><td>Straight-line code; every step passes or throws.</td><td><code>GatewayIT</code></td></tr>
+  <tr><td><code>PolicyEngine</code></td><td>Path allowlist → scope → RBAC → per-user quota → tenant quota → route limit.</td><td>Ordered so rejected requests spend no quota, and the shared route bucket is spent last.</td><td><code>PolicyEngineTest</code></td></tr>
+  <tr><td><code>RateLimiter</code> → <code>CircuitBreakingRateLimiter</code> → <code>InMemoryRateLimiter</code></td><td>Token buckets (capacity = burst, refill = per-minute rate) in Caffeine, one lock per bucket; keys <code>ip:</code> <code>user:</code> <code>tenant:</code> <code>route:</code>.</td><td>Interface + decorator: a Redis implementation plugs in at one bean; breaker + fail-open stay.</td><td><code>InMemoryRateLimiterTest</code>, <code>CircuitBreakingRateLimiterTest</code></td></tr>
+  <tr><td><code>ConcurrencyLimiter</code></td><td>Bulkhead: at most N requests in flight per tenant (default 50); refused at once, no queue.</td><td>Rate limits do not stop a slow tenant from holding the pool; this does.</td><td><code>ConcurrencyLimiterTest</code></td></tr>
+  <tr><td><code>AliasTable</code></td><td>Weighted upstream pick in O(1) (Vose alias method), built once per snapshot.</td><td>Immutable, lock-free; canary by weight.</td><td><code>AliasTableTest</code></td></tr>
+  <tr><td><code>RendezvousHash</code></td><td>Sticky routes: the same tenant always gets the same upstream, by weight.</td><td>Raising the canary's weight only moves tenants onto it.</td><td><code>RendezvousHashTest</code></td></tr>
+
+  <tr><td class="grp" colspan="4">Resilience</td></tr>
+  <tr><td><code>CircuitBreaker</code></td><td>Closed → open → half-open, count-based window; one per upstream host:port, plus <code>rate-limiter</code> and <code>config-db</code>.</td><td>Generation numbers drop stale results; 4xx and pool saturation are not failures; open upstream → fallback to the heaviest healthy one.</td><td><code>CircuitBreakerTest</code></td></tr>
+  <tr><td><code>RetryBudget</code>, <code>Backoff</code></td><td>Retries only for bodiless GET/HEAD/OPTIONS on connect failure or timeout; full-jitter backoff; retries + hedges ≤ ~10% of requests.</td><td>Integer token arithmetic; budget stops retry storms when everything fails.</td><td><code>RetryBudgetTest</code>, <code>HedgingBudgetIT</code></td></tr>
+  <tr><td>Hedging (in <code>ProxyController</code>)</td><td>After <code>hedgeAfterMs</code> without a response, a second copy to another upstream; first answer wins, the other is cancelled.</td><td>Only the request thread touches servlet objects, audit and breakers; the loser tells its breaker nothing.</td><td><code>GatewayIT</code> (hedging tests)</td></tr>
+  <tr><td><code>UpstreamProxy</code></td><td>Apache HttpClient 5 pool (500 total, 100 per upstream, 500ms lease timeout, 60s idle, validate after 2s idle, LIFO); strips hop-by-hop and gateway-owned headers, sets <code>X-Tenant-Id</code>, <code>X-User-Id</code>, <code>X-Role</code>, <code>X-Request-Id</code>, <code>X-Forwarded-For</code>, <code>traceparent</code>; streams both ways; counts new connections.</td><td>Idle timeout not aggressive (TIME_WAIT port exhaustion); connect failure 502, response timeout 504, pool full 503.</td><td><code>UpstreamProxyHeadersTest</code>, <code>GatewayIT</code></td></tr>
+
+  <tr><td class="grp" colspan="4">Configuration</td></tr>
+  <tr><td><code>ConfigStore</code></td><td>Routes and RBAC data in an immutable snapshot (one volatile read per request); tenants and revocations loaded on demand; polls the version token every 5s ±20%.</td><td>Keeps the old snapshot when the database loses its data; tenant writes invalidate locally.</td><td><code>ConfigStoreIT</code>, <code>ConfigStoreTest</code></td></tr>
+  <tr><td><code>SingleFlightCache</code></td><td>Short-TTL cache whose concurrent misses share one load (Go <code>singleflight</code>); stale if error; failures not cached; bounded.</td><td>1,000 simultaneous requests for a cold tenant = one database read.</td><td><code>SingleFlightCacheTest</code></td></tr>
+  <tr><td><code>ConfigRepository</code> / <code>JdbcConfigRepository</code></td><td>Source of truth: tenants, routes, roles, assignments, revoked tokens, version. Data and version change in one transaction.</td><td>Portable SQL only (UPDATE-then-INSERT); another database = driver + URL + schema file.</td><td><code>ConfigStoreIT</code></td></tr>
+
+  <tr><td class="grp" colspan="4">Control plane, errors, observability</td></tr>
+  <tr><td><code>AdminController</code>, <code>RbacController</code></td><td>CRUD for tenants and routes, token issue and revoke; custom roles and tenant users' roles.</td><td>Built-in roles read-only; custom roles hold service permissions only, so <code>rbac:write</code> cannot escalate.</td><td><code>GatewayIT</code></td></tr>
+  <tr><td><code>UpstreamUrlValidator</code></td><td>Rejects upstream URLs to link-local/metadata/loopback addresses when a route is saved.</td><td>SSRF guard for admin mistakes or a leaked admin credential.</td><td><code>UpstreamUrlValidatorTest</code></td></tr>
+  <tr><td><code>GatewayException</code>, <code>ErrorCode</code>, <code>GlobalExceptionHandler</code></td><td>One error type, one rendering (problem+json with <code>code</code>, <code>requestId</code>, <code>Retry-After</code> where useful).</td><td>Denials vs failures marked in the audit record.</td><td><code>GatewayIT</code></td></tr>
+  <tr><td><code>AsyncAuditSink</code>, metrics, alert rules</td><td>Audit: bounded queue, background writer, drops counted. Metrics: request timer, pool, breakers, churn, retries, hedges. Prometheus rules: SLO burn rate, latency, saturation.</td><td>Logging never blocks a request; metric tags bounded (never tenant, path or IP).</td><td><code>AsyncAuditSinkTest</code>, <code>GatewayIT</code> (metrics, alert rules)</td></tr>
+</table>
+
+<h3>1.4 State: what lives where</h3>
+<table>
+  <tr><th style="width:30%">State</th><th style="width:20%">Where</th><th>Lifetime and consistency</th></tr>
+  <tr><td>Routes, custom roles, role assignments</td><td>Snapshot in memory</td><td>Reloaded whole when the version token changes: at once on the writing instance, ≤ 5s on others.</td></tr>
+  <tr><td>Tenants, token revocations</td><td>Cache in memory (5s TTL)</td><td>Loaded on first use through a single flight; stale if the database fails.</td></tr>
+  <tr><td>Rate-limit buckets, bulkhead permits, breaker states, retry budget</td><td>Memory, per instance</td><td>Lost on restart without harm. Per instance: N instances ≈ N× quota (a shared store is the documented next step).</td></tr>
+  <tr><td>Tenants, routes, roles, assignments, revoked tokens, version</td><td>Config database</td><td>Source of truth. Tables: <code>tenants</code>, <code>routes</code> (unique prefix), <code>roles</code>, <code>role_assignments</code>, <code>revoked_tokens</code>, <code>config_version</code>.</td></tr>
+  <tr><td>Operators, built-in roles, signing key</td><td><code>application.yml</code> / environment</td><td>Reviewed as code; the same on every instance.</td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2>Part 2. End-to-end workflow</h2>
+
+<h3>2.1 A tenant request, from client to upstream and back</h3>
+<div class="figure">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant A as AuditFilter
+  participant I as IpRateLimitFilter
+  participant U as AuthFilter
+  participant P as ProxyController
+  participant E as PolicyEngine
+  participant X as UpstreamProxy
+  participant S as Upstream
+  C->>A: GET /orders/7 (Bearer JWT, traceparent?)
+  A->>A: request id, client IP, trace, canonical path
+  A->>I: chain
+  I->>I: bucket ip:addr
+  I->>U: chain
+  U->>U: verify RS256 JWT, then jti revoked? (cache, 5s)
+  U->>P: Principal(tenant, user, role, scopes)
+  P->>P: tenant (cache / single flight), route (snapshot), body size
+  P->>E: enforce
+  E->>E: allowlist, scope, RBAC, user / tenant / route quotas
+  E-->>P: X-RateLimit headers
+  P->>P: bulkhead permit, pick upstream, breaker permit
+  P->>X: prepare (headers, traceparent with new span id)
+  X->>S: pooled connection
+  S-->>X: status + headers
+  X-->>C: stream status, headers, body
+  P->>P: report outcome to breaker, release permits
+  A->>A: finally: one audit entry (async), request metric
+</pre>
+<div class="cap">Figure 3. An allowed request: no database call unless the tenant or the token's revocation state is not cached</div>
+</div>
+
+<h3>2.2 Every check, in order, and what it rejects with</h3>
+<table class="checks">
+  <tr><th style="width:4%">#</th><th style="width:24%">Stage (class)</th><th style="width:30%">Check</th><th style="width:20%">On failure</th><th>Why here</th></tr>
+  <tr><td>1</td><td>Path (<code>AuditFilter</code>)</td><td>Canonical, unambiguous path</td><td>400 <code>BAD_PATH</code></td><td>Before any decision uses the path</td></tr>
+  <tr><td>2</td><td>Address (<code>IpRateLimitFilter</code>)</td><td>Per-IP bucket (1200/min, burst 100)</td><td>429 <code>IP_RATE_LIMITED</code></td><td>Only dimension for unauthenticated traffic</td></tr>
+  <tr><td>3</td><td>Identity (<code>AuthFilter</code>)</td><td>Valid RS256 JWT, not revoked</td><td>401 <code>UNAUTHENTICATED</code></td><td>Revocation looked up only after the signature passes</td></tr>
+  <tr><td>4</td><td>Tenant (<code>ProxyController</code>)</td><td>Exists and enabled</td><td>403 <code>TENANT_DISABLED</code> / 503 <code>CONFIG_UNAVAILABLE</code></td><td>Kill switch applies to tokens already issued</td></tr>
+  <tr><td>5</td><td>Route</td><td>Longest segment-aware prefix</td><td>404 <code>ROUTE_NOT_FOUND</code></td><td>Snapshot, no I/O</td></tr>
+  <tr><td>6</td><td>Body size</td><td><code>Content-Length</code> ≤ limit (chunked capped while streaming)</td><td>413 <code>PAYLOAD_TOO_LARGE</code></td><td>Before spending quota</td></tr>
+  <tr><td>7</td><td>Allowlist (<code>PolicyEngine</code>)</td><td>Path in the tenant's prefixes</td><td>403 <code>PATH_NOT_ALLOWED</code></td><td rowspan="3">Authorization before any quota is spent</td></tr>
+  <tr><td>8</td><td>Scope</td><td>Token and tenant both allow the route's service</td><td>403 <code>INSUFFICIENT_SCOPE</code></td></tr>
+  <tr><td>9</td><td>RBAC</td><td>Role grants <code>service:read|write|delete</code> (from the method); user still holds the role</td><td>403 <code>PERMISSION_DENIED</code></td></tr>
+  <tr><td>10</td><td>User quota</td><td><code>user:tenant/user</code> bucket</td><td>429 <code>USER_RATE_LIMITED</code></td><td>One runaway user cannot drain the tenant</td></tr>
+  <tr><td>11</td><td>Tenant quota</td><td><code>tenant:id</code> bucket (rate + burst)</td><td>429 <code>RATE_LIMITED</code></td><td>The tenant's contract</td></tr>
+  <tr><td>12</td><td>Route limit</td><td><code>route:id</code> bucket, all tenants together</td><td>429 <code>ROUTE_RATE_LIMITED</code></td><td>Shared, so spent last</td></tr>
+  <tr><td>13</td><td>Bulkhead (<code>ConcurrencyLimiter</code>)</td><td>Tenant's requests in flight &lt; limit</td><td>429 <code>CONCURRENCY_LIMITED</code></td><td>Protects the pool from slow tenants</td></tr>
+  <tr><td>14</td><td>Breaker (<code>CircuitBreaker</code>)</td><td>Picked upstream admits, else heaviest healthy one</td><td>503 <code>CIRCUIT_OPEN</code> (all open)</td><td>Fail fast instead of waiting on a dead upstream</td></tr>
+  <tr><td>15</td><td>Proxy (<code>UpstreamProxy</code>)</td><td>Connection lease, connect, response</td><td>503 <code>UPSTREAM_SATURATED</code> / 502 / 504</td><td>Upstream 4xx/5xx pass through unchanged</td></tr>
+</table>
+<p class="small">All 429 and 503 responses carry <code>Retry-After</code>. Every policy rejection (400, 401, 403, 404, 413, 429, 503 <code>CIRCUIT_OPEN</code>) is audited as <code>DENY</code> with its reason, and tests assert the upstream received nothing; dependency failures (<code>CONFIG_UNAVAILABLE</code>, 502/503/504 from the upstream call) are audited with their code but not as a denial.</p>
+
+<h3>2.3 The upstream call: pick, protect, retry or hedge</h3>
+<div class="figure">
+<pre class="mermaid">
+flowchart TB
+  S(["attempt"]) --> PK{"sticky route?"}
+  PK -- no --> W["weighted pick<br/>(AliasTable)"]
+  PK -- yes --> H["pick by tenant<br/>(RendezvousHash)"]
+  W & H --> AD{"its breaker<br/>admits?"}
+  AD -- no --> FB["heaviest upstream that admits<br/>(none: 503 CIRCUIT_OPEN)"]
+  AD -- yes --> HG{"hedged route and<br/>bodiless GET/HEAD?"}
+  FB --> HG
+  HG -- no --> FW["forward"]
+  HG -- yes --> HC["first call; no answer after<br/>hedgeAfterMs → second copy<br/>(budget + breaker permitting)"]
+  HC --> WIN["first answer wins,<br/>other cancelled"]
+  FW --> OK{"connect error / timeout<br/>before any byte sent?"}
+  OK -- no --> DONE(["report to breaker,<br/>stream the response"])
+  OK -- "yes: idempotent, attempts<br/>and budget left" --> BO["full-jitter backoff,<br/>prefer another upstream"] --> S
+  WIN --> DONE
+</pre>
+<div class="cap">Figure 4. Retries and hedges share one budget (~10% extra load) and both respect the breakers</div>
+</div>
+
+<h3>2.4 The control plane: from an empty gateway to a served request</h3>
+<div class="figure">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant O as Operator
+  participant G as Gateway (instance A)
+  participant D as Config database
+  participant B as Gateway (instance B)
+  participant T as Tenant client
+  O->>G: POST /admin/login {user, key, role: admin}
+  G-->>O: session JWT (one role, 1h)
+  O->>G: POST /admin/tenants (quota, allowlist, services)
+  G->>D: insert tenant + new version token (one transaction)
+  O->>G: PUT /admin/rbac/tenants/acme/users/alice {roles}
+  O->>G: POST /admin/routes (prefix, weighted upstreams, sticky, hedge, limit)
+  G->>D: insert route + new version
+  G->>G: refresh snapshot now
+  B->>D: poll version (every 5s ±20%)
+  B->>B: changed: reload snapshot
+  O->>G: POST /admin/tenants/acme/tokens {user, role, scopes}
+  G-->>O: RS256 JWT (tid, sub, role, scope, jti)
+  T->>B: request with the token
+  B-->>T: served (workflow 2.1)
+  O->>G: POST /admin/tokens/{jti}/revoke
+  G->>D: revoked_tokens row (no version change)
+  T->>B: same token
+  B-->>T: 401 within the 5s cache TTL (at once on instance A)
+</pre>
+<div class="cap">Figure 5. Each admin call needs a permission of the session's single role; every write commits data and version together</div>
+</div>
+
+<h3>2.5 When something fails</h3>
+<table>
+  <tr><th style="width:24%">Failure</th><th>What the gateway does</th></tr>
+  <tr><td>Config database down</td><td>Routes and RBAC from the last snapshot; cached tenants served stale; unknown tenants 503 at once once the <code>config-db</code> breaker opens; revocation checks fail open (counted, alerted); admin writes fail.</td></tr>
+  <tr><td>Config database lost its data</td><td>Missing version detected: old snapshot kept, tenant reloads refused so cached values stay.</td></tr>
+  <tr><td>Upstream down or erroring</td><td>Its breaker opens; traffic falls back to the route's healthiest upstream; 503 with <code>Retry-After</code> if all are open.</td></tr>
+  <tr><td>Upstream slow</td><td>Response timeout → 504; hedging (if enabled) answers from the other upstream; bulkhead caps how much of the pool one tenant holds.</td></tr>
+  <tr><td>Connection pool exhausted</td><td>Wait ≤ 500ms for a connection, then 503 <code>UPSTREAM_SATURATED</code>; not counted against the upstream.</td></tr>
+  <tr><td>Rate limiter failing</td><td>Its breaker opens; fail open by default (serve without limits) or 503 if configured.</td></tr>
+  <tr><td>Audit writer behind</td><td>Queue (10,000) fills, entries dropped and counted; requests never wait.</td></tr>
+  <tr><td>Traffic burst / thundering herd</td><td>Per-IP, per-user, per-tenant, per-route buckets; single flight on cache misses; jittered backoff and config polling.</td></tr>
+</table>
+
+<div class="callout ok"><b>Built for, not built (good places to dive deep):</b> Kafka behind the <code>AuditSink</code> interface; OpenTelemetry export using today's trace and span ids; a Redis token bucket behind the <code>RateLimiter</code> interface (fixes N× quota with N instances); push invalidation of config (Postgres <code>LISTEN/NOTIFY</code>); bot detection before authentication; nearest-region routing in front of the gateway.</div>
+
+<!-- Render: open in a browser, or headless Chrome: --print-to-pdf=design-brief.pdf --virtual-time-budget=20000 design-brief.html -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: false, theme: 'base', securityLevel: 'loose',
+    themeVariables: {
+      fontFamily: 'Helvetica Neue, Helvetica, Arial, sans-serif', fontSize: '12px',
+      primaryColor: '#e8f0fe', primaryBorderColor: '#2563eb', primaryTextColor: '#0b1f4d',
+      lineColor: '#64748b', secondaryColor: '#e7f6ec', tertiaryColor: '#fff4e0',
+      actorBkg: '#e8f0fe', actorBorder: '#2563eb', actorTextColor: '#0b1f4d',
+      signalColor: '#334155', signalTextColor: '#1f2937',
+      noteBkgColor: '#fff4e0', noteBorderColor: '#b45309', noteTextColor: '#7c2d12',
+      sequenceNumberColor: '#ffffff', activationBkgColor: '#dbeafe',
+      clusterBkg: '#f8fafc', clusterBorder: '#cbd5e1'
+    },
+    flowchart: { htmlLabels: true, curve: 'basis', padding: 8, useMaxWidth: true },
+    sequence: { useMaxWidth: true, mirrorActors: false, boxMargin: 6 }
+  });
+  mermaid.run({ querySelector: '.mermaid' }).then(() => { document.body.setAttribute('data-rendered', 'yes'); })
+    .catch(e => { document.body.setAttribute('data-rendered', 'error: ' + e); });
+</script>
+</body>
+</html>
