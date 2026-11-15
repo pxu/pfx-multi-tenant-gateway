@@ -62,6 +62,10 @@ docker compose up -d --build   # gateway :8080 (data plane + admin), :8081 (heal
 Without Docker: `GATEWAY_OPS_KEY_SHA256=$(printf %s local-ops-key | shasum -a 256 | cut -d' ' -f1) ./mvnw spring-boot:run`
 (JDK 21). Nothing else to run: the config is an embedded H2 database in `./data/`.
 
+On DigitalOcean App Platform (gateway + stable/canary upstreams in one app, redeployed on every merge to
+`main`): `./scripts/do-app.sh deploy`, then `./scripts/do-app.sh demo`. See
+[Deploy to DigitalOcean App Platform](#deploy-to-digitalocean-app-platform).
+
 ## Access control: scopes and RBAC
 
 Two layers, for operators of the gateway and for tenant users alike:
@@ -222,10 +226,10 @@ comments. Environment variables:
 
 | Variable | Default | |
 |---|---|---|
-| `GATEWAY_OPS_KEY_SHA256` | none | Hex SHA-256 of the bootstrap user `ops`'s key; it cannot log in if unset |
-| `GATEWAY_JWT_PRIVATE_KEY` | none | PKCS#8 PEM; ephemeral key if unset |
+| `GATEWAY_OPS_KEY_SHA256` | none | Hex SHA-256 of the bootstrap user `ops`'s key; it cannot log in if unset (on App Platform: a SECRET set by `do-app.sh`) |
+| `GATEWAY_JWT_PRIVATE_KEY` | none | PKCS#8 PEM (headers and line breaks optional); ephemeral key if unset, so tokens die with the instance (on App Platform: a SECRET set by `do-app.sh`) |
 | `gateway.ip-rate-limit` (yml) | 1200/min, burst 100 | Per client address, before authentication; `requests-per-minute: 0` turns it off |
-| `gateway.trusted-proxies` (yml) | none | Load balancers (IPs or CIDRs) whose `X-Forwarded-For` is believed |
+| `gateway.trusted-proxies` (yml) | none | Load balancers (IPs or CIDRs) whose `X-Forwarded-For` is believed (empty on App Platform for now: see known gaps) |
 | `gateway.continue-client-traces` (yml) | true | Join a valid client `traceparent`; `false` = every request starts a new trace at the gateway |
 | `gateway.config-db-circuit-breaker` (yml) | 50% of the last 10 reads (at least 5), open 5s | Breaker around the database reads on the request path (tenants, token revocations); `spring.datasource.hikari.connection-timeout` (2000 ms, Hikari's default is 30 s) bounds each read before it opens |
 | `GATEWAY_DB_URL` | `jdbc:h2:file:./data/gateway` | Config database; any JDBC URL (add the driver) |
@@ -259,24 +263,77 @@ coverage gate (≥ 80% of lines).
   `RetryBudgetTest` (retries ≈ 10% of requests even when all fail, full-jitter bounds), `CircuitBreakingRateLimiterTest` the breaker and fail-open/closed around it, with a store that can be made to fail.
   `ConfigStoreIT` runs two config stores against one database (propagation, surviving a wiped database, create-or-replace, prefix uniqueness).
 
-CI (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push and builds the Docker image.
+CI (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push and builds the Docker image. Deployment is
+separate: App Platform builds from `main` itself on every merge (`deploy/do-app.yaml`).
 
 ## A real upstream (local or on DigitalOcean)
 
 [upstream-app/](upstream-app/README.md) is a small Go service to put behind the gateway: it echoes
 requests, waits as long as asked (`/delay/{ms}`, `/random-delay?min=&max=`), answers any status code,
-and fails a share of requests on purpose (`FAIL_PCT`). Deployed as two apps on DigitalOcean App
-Platform (a stable one and a canary that fails 60% of requests; `upstream-app/deploy/`), or locally:
+and fails a share of requests on purpose (`FAIL_PCT`): a stable one and a canary that fails 60% of
+requests. Locally:
 
 ```bash
 docker compose -f upstream-app/docker-compose.yml up -d --build   # gateway :9180, stable :9201, canary :9202
-./scripts/demo-do-upstream.sh          # STABLE_URL / CANARY_URL point it at the apps on DigitalOcean
+./scripts/demo-do-upstream.sh
 ```
+
+On DigitalOcean the gateway and both upstreams run as one app: see the next section.
 
 The demo shows: the headers the upstream receives (gateway identity headers and `traceparent`, no
 `Authorization`, no client-spoofed `X-Tenant-Id`); a 90/10 canary whose breaker opens and falls back to
 stable; a sticky canary; a 504 after a timeout and its retry; hedging; an upstream 418 passed through;
 and policy rejections.
+
+## Deploy to DigitalOcean App Platform
+
+[deploy/do-app.yaml](deploy/do-app.yaml) is one App Platform app with three components, each built by
+App Platform from its Dockerfile (nothing is built or pushed from your machine):
+
+| Component | Built from | Reachable |
+|---|---|---|
+| `pfx-multi-tenant-gateway` | `Dockerfile` | public HTTPS on the app's URL (port 8080: data plane + admin API); 8081 (health, metrics) inside the app only |
+| `stable` | `upstream-app/Dockerfile`, `VERSION=stable` | inside the app only, as `http://stable:8080` |
+| `canary` | `upstream-app/Dockerfile`, `VERSION=canary`, `FAIL_PCT=60` | inside the app only, as `http://canary:8080` |
+
+The component names match the docker-compose service names, so the demo's default upstream URLs work
+unchanged. App Platform's health check is the gateway's readiness endpoint on 8081. Every merge to `main`
+redeploys (`deploy_on_push`).
+
+```bash
+brew install doctl && doctl auth init   # once: a DigitalOcean API token that may read and write apps
+./scripts/do-app.sh validate            # fills in the secrets, validates the spec, changes nothing
+./scripts/do-app.sh deploy              # creates the app, or updates it to the spec; waits until live
+./scripts/do-app.sh demo                # scripts/demo-do-upstream.sh against the deployed gateway
+./scripts/do-app.sh login               # an admin session token, for your own curl calls
+./scripts/do-app.sh logs                # follow the gateway's log (one JSON audit line per request)
+```
+
+The repository is private: connect DigitalOcean's GitHub app to it first (Apps > Create App > GitHub).
+
+**Secrets.** `do-app.sh` keeps them in `~/.config/pfx-gateway/` (mode 600, created on the first
+`validate`/`deploy`, never committed): `ops-key` is operator `ops`'s key (the app stores only its SHA-256
+in `GATEWAY_OPS_KEY_SHA256`), `jwt-private-key.pem` signs tokens (`GATEWAY_JWT_PRIVATE_KEY`, so tokens
+survive a redeploy). Both are SECRET variables in the app. `local-ops-key` does not work there.
+
+**Testing the deployed gateway with the scripts.** The management port is internal on App Platform, so
+the scripts take `MANAGEMENT=` (empty) to skip the readiness check and the metrics; `do-app.sh demo`
+sets it. For load tests see [Against the App Platform deployment](#against-the-app-platform-deployment).
+
+**Things that differ from local runs:**
+
+- **The config starts empty after every deploy.** It is the H2 file inside the gateway's container; the
+  scripts recreate their tenants and routes each run. For data that must last, use a managed Postgres
+  (`GATEWAY_DB_URL`, see design decisions §4).
+- **App Platform rewrites an upstream 502/503 to 504** on the way to the client and keeps the original
+  status in `X-Do-Orig-Status`. The gateway and its audit log see the real status; the demo prints both
+  (`503(shown as 504)`). 418, 500 and other codes pass through unchanged.
+- **The gateway sees the CDN's address, not the client's.** Requests arrive through App Platform's edge
+  (Cloudflare), whose addresses are not in `gateway.trusted-proxies`, so `X-Forwarded-For`, the audit
+  `clientIp` and the per-address rate limit use the edge node's address: unrelated clients can share a
+  bucket. Trusting the edge's address ranges would fix it; not done yet.
+- **One instance.** Rate limits and the H2 config are per instance; raise `instance_count` only together
+  with a shared database.
 
 ## Load testing
 
@@ -304,6 +361,54 @@ upstream pool (default 100 per upstream), and `MAX_CONNECTIONS` caps the load ge
 does not run out of local ports itself. For test 2: `LT_POOL_TOTAL`, `LT_TOMCAT_MAX_CONNECTIONS` and
 `LT_JAVA_OPTS` set the pool total, Tomcat's connection limit and JVM flags; the `slow-upstream` service
 (port 9091) delays each response by 100 ms – 5 s, and `TIMEOUT` raises the client's timeout.
+
+Settings of `scripts/loadtest.sh` (environment variables; the full list is at the top of the script):
+
+| Variable | Default | |
+|---|---|---|
+| `RATES` | `500 1000 2000 4000 8000 12000` | requests/s, one step each; the run stops at the first step missing the SLO |
+| `DURATION`, `WARMUP` | `30s`, `20s` | length of each step, and of the warm-up at the first rate |
+| `P99_MS`, `SUCCESS_MIN` | `50`, `0.999` | the SLO |
+| `GATEWAY` | `http://localhost:9080` | the gateway's data plane and admin API |
+| `MANAGEMENT` | `http://localhost:9081` | the gateway's management port, for the readiness check and the pool, audit and breaker figures; **empty** = not reachable (App Platform): those are skipped and shown as `-` |
+| `OPS_USER`, `OPS_KEY` | `ops`, `local-ops-key` | operator used to create the test tenants, route and tokens |
+| `UPSTREAM` | `http://localhost:9090` | the upstream as the load generator reaches it (for the baseline) |
+| `UPSTREAM_IN_DOCKER` | `http://upstream:80` | the upstream as the gateway reaches it (the test route's target) |
+| `BASELINE` | `1` | also load the upstream directly once; `0` when the load generator cannot reach it |
+| `TENANTS` | `4` | test tenants; tokens rotate across them |
+| `CONTAINER` | `gateway-loadtest-gateway-1` | Docker container sampled for `gw-cpu`; empty = skip |
+| `TIMEOUT`, `MAX_CONNECTIONS` | `5s`, `2000` | per-request timeout; cap on the load generator's connections |
+
+Each run writes `loadtest-results/<time>/` (vegeta results, per-step reports, `summary.txt`); only
+`REPORT.md` is kept in the repository.
+
+### Against the App Platform deployment
+
+```bash
+GATEWAY=$(./scripts/do-app.sh url) MANAGEMENT= OPS_KEY=$(cat ~/.config/pfx-gateway/ops-key) \
+UPSTREAM_IN_DOCKER=http://stable:8080 BASELINE=0 CONTAINER= \
+RATES="10 15" DURATION=10s WARMUP=3s P99_MS=2000 ./scripts/loadtest.sh
+```
+
+`MANAGEMENT=` because the management port is internal (no pool, audit or breaker figures; read the
+gateway's log with `./scripts/do-app.sh logs`); `UPSTREAM_IN_DOCKER=http://stable:8080` routes the test
+to the `stable` component; `BASELINE=0` and `CONTAINER=` because neither the upstream nor the container
+is reachable from outside the app. The test tenants and route live only until the next deploy.
+
+What limits it there (measured from a laptop: 10 requests/s at p99 99 ms; at 50 requests/s, 4 of 500
+answered 429):
+
+- **The per-address limit, 20 requests/s per address.** The gateway sees App Platform's edge (Cloudflare)
+  addresses, not the load generator's, and requests from one machine mostly arrive through one edge
+  node, so above ~20 requests/s they get 429 `IP_RATE_LIMITED`. Keep `RATES` at or below about 15, or
+  for a real load test set `GATEWAY_IPRATELIMIT_REQUESTSPERMINUTE` to `0` in `deploy/do-app.yaml`,
+  deploy, and put it back afterwards (the limit is the only per-address protection before
+  authentication).
+- **The internet path.** Latency includes the trip to the `sfo` region and App Platform's edge; run the
+  load generator on a Droplet in `sfo` for numbers about the gateway rather than the network, and set
+  `P99_MS` accordingly.
+- **One small instance** (`apps-s-1vcpu-2gb`, one shared vCPU) and an upstream that echoes JSON rather
+  than answering `ok`: not comparable with the figures in REPORT.md.
 
 ## Security assumptions and known gaps
 
@@ -336,6 +441,7 @@ does not run out of local ports itself. For test 2: `LT_POOL_TOTAL`, `LT_TOMCAT_
 | Token issuance checks role assignments in this instance's snapshot | Assigning a role through one instance and issuing a token through another within ~5s can fail with 400 "does not hold role" | Retry, or issue on the same instance; pub/sub invalidation |
 | Operators and their roles live in config | Adding an operator needs a config change and restart (custom roles and tenant users do not) | Operators from SSO with groups mapped to roles |
 | Sessions cannot be revoked one by one | A leaked session works until it expires (≤ 1h) unless the user's role is removed (login guessing is throttled per address) | Session `jti` deny-list |
+| Behind App Platform the client address is the CDN edge's | `X-Forwarded-For`, the audit `clientIp` and the per-address limit see Cloudflare edge addresses (not in `trusted-proxies`): unrelated clients can share one bucket, one client can spread over several | Add the edge's address ranges to `gateway.trusted-proxies` (and keep them current) |
 | Admin API on the same port as the data plane | Reachable from wherever tenants are | Serve it on an internal-only port or network |
 | No mTLS to upstreams | Upstreams must trust the network | mTLS / workload identities |
 | Only bodiless idempotent requests are retried or hedged; the hedge delay is fixed per route | A POST that failed to connect is not retried even though it never reached the upstream; `hedgeAfterMs` must be tuned by hand | Retry any method on a proven connect failure; derive the hedge delay from the route's measured p95 |
@@ -385,3 +491,4 @@ does not run out of local ports itself. For test 2: `LT_POOL_TOTAL`, `LT_TOMCAT_
 | step 36 | Documentation checked against the assignment: request-flow diagram fixed (a merged node, missing branches), sequence diagrams render again, README and threat model corrected |
 | step 37 | A real upstream: `upstream-app` (Go, standard library: echo, delays, status codes, injected failures), App Platform specs for a stable and a canary app, a demo script, and a CI job |
 | step 38 | Only the stress test report (`loadtest-results/REPORT.md`) stays in the repository; the per-run result directories stay on the machine that ran them |
+| step 39 | DigitalOcean App Platform: one app (`deploy/do-app.yaml`) with the gateway and internal stable/canary upstreams, health check on the management port, secrets kept outside the repo (`scripts/do-app.sh`); the demo and load-test scripts run without the management port |

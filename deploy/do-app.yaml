@@ -1,0 +1,93 @@
+# DigitalOcean App Platform spec: the gateway and two demo upstreams in one app.
+#
+#   ./scripts/do-app.sh deploy        # fills in the two secrets below, then creates or updates the app
+#
+# Do not pass this file to doctl directly: ${...} are placeholders that scripts/do-app.sh replaces with
+# values from ~/.config/pfx-gateway/ (generated there on first use, never committed).
+#
+# Components (each built from its Dockerfile by App Platform; nothing is built locally):
+#   pfx-multi-tenant-gateway  public on 8080 (data plane + admin API); 8081 (health, metrics) internal only
+#   stable, canary            upstream-app (Go), internal only: the gateway reaches them as
+#                             http://stable:8080 and http://canary:8080. Separate components = separate
+#                             hosts, so each gets its own circuit breaker in the gateway.
+#
+# The config database is the embedded H2 file inside the gateway's container: tenants, routes and RBAC
+# data are lost on every redeploy (use a managed Postgres for anything that must last).
+name: pfx-multi-tenant-gateway
+region: sfo
+alerts:
+- rule: DEPLOYMENT_FAILED
+- rule: DOMAIN_FAILED
+ingress:
+  rules:
+  - component:
+      name: pfx-multi-tenant-gateway
+    match:
+      path:
+        prefix: /
+services:
+- name: pfx-multi-tenant-gateway
+  github:
+    repo: pxu/pfx-multi-tenant-gateway
+    branch: main
+    deploy_on_push: true            # every merge to main redeploys
+  source_dir: /
+  dockerfile_path: /Dockerfile
+  http_port: 8080
+  internal_ports:
+  - 8081                            # actuator: health checks and metrics, never public
+  instance_count: 1                 # rate limits and the H2 config are per instance
+  instance_size_slug: apps-s-1vcpu-2gb
+  health_check:
+    http_path: /actuator/health/readiness
+    port: 8081
+    initial_delay_seconds: 20       # JVM start-up
+  envs:
+  - key: GATEWAY_OPS_KEY_SHA256     # SHA-256 (hex) of operator "ops"'s key
+    scope: RUN_TIME
+    type: SECRET
+    value: "${GATEWAY_OPS_KEY_SHA256}"
+  - key: GATEWAY_JWT_PRIVATE_KEY    # PKCS#8 RSA key, base64 body on one line; tokens survive redeploys
+    scope: RUN_TIME
+    type: SECRET
+    value: "${GATEWAY_JWT_PRIVATE_KEY}"
+- name: stable
+  github:
+    repo: pxu/pfx-multi-tenant-gateway
+    branch: main
+    deploy_on_push: true
+  source_dir: /upstream-app
+  dockerfile_path: /upstream-app/Dockerfile
+  internal_ports:
+  - 8080
+  instance_count: 1
+  instance_size_slug: apps-s-1vcpu-0.5gb
+  health_check:
+    http_path: /healthz
+    port: 8080
+  envs:
+  - key: VERSION
+    value: stable
+  - key: PORT
+    value: "8080"
+- name: canary
+  github:
+    repo: pxu/pfx-multi-tenant-gateway
+    branch: main
+    deploy_on_push: true
+  source_dir: /upstream-app
+  dockerfile_path: /upstream-app/Dockerfile
+  internal_ports:
+  - 8080
+  instance_count: 1
+  instance_size_slug: apps-s-1vcpu-0.5gb
+  health_check:
+    http_path: /healthz
+    port: 8080
+  envs:
+  - key: VERSION
+    value: canary
+  - key: FAIL_PCT
+    value: "60"                     # the bad release: 60% of its requests answer 503
+  - key: PORT
+    value: "8080"
