@@ -8,11 +8,19 @@
 # (coordinated omission). Each step runs DURATION at one rate; the run stops at the first step that
 # misses the SLO (success < SUCCESS_MIN or p99 > P99_MS). Results: loadtest-results/<time>/.
 #
+# Against App Platform (deploy/do-app.yaml), from a machine near the app's region rather than a laptop:
+#   GATEWAY=$(./scripts/do-app.sh url) MANAGEMENT= OPS_KEY=$(cat ~/.config/pfx-gateway/ops-key) \
+#   UPSTREAM_IN_DOCKER=http://stable:8080 BASELINE=0 CONTAINER= RATES="10 15" P99_MS=2000 ./scripts/loadtest.sh
+# There the gateway sees the CDN edge's address, so above ~20 requests/s the per-address limit answers 429
+# (README: "Against the App Platform deployment").
+#
 # Env (defaults in brackets):
 #   RATES ["500 1000 2000 4000 8000 12000"]  requests/s per step     DURATION [30s]  WARMUP [20s]
 #   P99_MS [50]  SUCCESS_MIN [0.999]  TENANTS [4] (tokens rotate across them; one tenant's quota tops
 #   out at 1,000,000/min)  BASELINE [1] (also load the upstream directly at the highest rate)
-#   GATEWAY [http://localhost:9080]  MANAGEMENT [http://localhost:9081]  UPSTREAM [http://localhost:9090]
+#   GATEWAY [http://localhost:9080]  MANAGEMENT [http://localhost:9081] (empty = not reachable, as on App
+#   Platform: no readiness check, no pool/audit/breaker figures)  UPSTREAM [http://localhost:9090]
+#   OPS_USER [ops]  OPS_KEY [local-ops-key]
 #   UPSTREAM_IN_DOCKER [http://upstream:80] (the upstream as the gateway reaches it)
 #   CONTAINER [gateway-loadtest-gateway-1] (for CPU samples; empty = skip)
 #   TIMEOUT [5s] per request (raise it for a slow upstream)
@@ -24,7 +32,7 @@ command -v vegeta >/dev/null || { echo "vegeta not found: brew install vegeta (o
 command -v python3 >/dev/null || { echo "python3 not found"; exit 1; }
 
 G="${GATEWAY:-http://localhost:9080}"
-M="${MANAGEMENT:-http://localhost:9081}"
+M="${MANAGEMENT-http://localhost:9081}"
 UP="${UPSTREAM:-http://localhost:9090}"
 UP_INTERNAL="${UPSTREAM_IN_DOCKER:-http://upstream:80}"
 RATES="${RATES:-500 1000 2000 4000 8000 12000}"
@@ -42,7 +50,9 @@ seconds() { python3 -c "import re, sys; v = sys.argv[1]; m = re.fullmatch(r'(\d+
 print(int(m[1]) / {'ms': 1000, 's': 1, 'm': 60}[m[2]])" "$1"; }
 
 # ---- setup: tenants with quotas far above the test, one route to the no-op upstream, tokens ----
-curl -sf "$M/actuator/health/readiness" >/dev/null || { echo "gateway not ready at $M (start the stack first)"; exit 1; }
+if [ -n "$M" ]; then
+  curl -sf "$M/actuator/health/readiness" >/dev/null || { echo "gateway not ready at $M (start the stack first)"; exit 1; }
+fi
 SESSION=$(curl -sf -X POST "$G/admin/login" -H 'Content-Type: application/json' \
   -d "{\"user\": \"${OPS_USER:-ops}\", \"key\": \"${OPS_KEY:-local-ops-key}\", \"role\": \"admin\"}" | json '["token"]')
 ADMIN=(-H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json')
@@ -73,7 +83,8 @@ done
 printf 'GET %s/lt/items/1\n\n' "$UP" > "$OUT/baseline-targets.txt"
 
 # ---- helpers ----------------------------------------------------------------------------------
-metric() { # sum of one counter in the Prometheus scrape (0 if absent)
+metric() { # sum of one counter in the Prometheus scrape (0 if absent or no management port)
+  [ -n "$M" ] || { echo 0; return; }
   curl -sf "$M/actuator/prometheus" | python3 -c "import sys; print(sum(float(l.split()[-1]) for l in sys.stdin \
 if l.startswith('$1') and not l.startswith('#')))"
 }
@@ -85,7 +96,7 @@ attack() { # name rate duration targets -> results bin, prints a summary row
       docker stats --no-stream --format '{{.CPUPerc}}' "$CONTAINER" > "$OUT/$name.cpu" 2>/dev/null || true
     fi
     # upstream pool halfway through: leased/pending (pending > 0 = requests waiting for a connection)
-    echo "$(metric 'httpcomponents_httpclient_pool_total_connections{httpclient="upstream",state="leased"')/$(metric \
+    [ -n "$M" ] && echo "$(metric 'httpcomponents_httpclient_pool_total_connections{httpclient="upstream",state="leased"')/$(metric \
       'httpcomponents_httpclient_pool_total_pending')" > "$OUT/$name.pool" 2>/dev/null || true ) &
   vegeta attack -targets="$targets" -rate="$rate/s" -duration="$duration" -timeout="${TIMEOUT:-5s}" \
     -max-connections="${MAX_CONNECTIONS:-2000}" > "$OUT/$name.bin"
@@ -137,6 +148,6 @@ echo
 echo "Highest step within the SLO: ${best:-none} requests/s"
 echo "During the steps: audit entries dropped $(python3 -c "print(int($(metric gateway_audit_dropped_total) - $dropped0))")," \
      "new upstream connections $(python3 -c "print(int($(metric gateway_upstream_connections_opened_total) - $opened0))"),"\
-     "breakers not closed $(curl -sf "$M/actuator/prometheus" | grep '^gateway_circuit_state{' | grep -vc ' 0.0$' || true)"
+     "breakers not closed $(if [ -n "$M" ]; then curl -sf "$M/actuator/prometheus" | grep '^gateway_circuit_state{' | grep -vc ' 0.0$' || true; else echo "- (no management port)"; fi)"
 echo "Latency plots: vegeta plot $OUT/gateway-*.bin > $OUT/plot.html"
 } | tee "$OUT/summary.txt"

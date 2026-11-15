@@ -8,7 +8,7 @@ region: nyc
 services:
   - name: upstream
     github:
-      repo: pxu/multi-tenant-api-gateway
+      repo: pxu/pfx-multi-tenant-gateway
       branch: main
       deploy_on_push: false
     source_dir: upstream-app

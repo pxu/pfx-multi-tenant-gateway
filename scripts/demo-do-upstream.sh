@@ -5,22 +5,32 @@
 #   docker compose -f upstream-app/docker-compose.yml up -d --build        # gateway + both upstreams, locally
 #   ./scripts/demo-do-upstream.sh
 #
-#   STABLE_URL=https://gw-upstream-stable-....ondigitalocean.app \
-#   CANARY_URL=https://gw-upstream-canary-....ondigitalocean.app ./scripts/demo-do-upstream.sh
+#   ./scripts/do-app.sh demo      # against the app on DigitalOcean App Platform (deploy/do-app.yaml)
 #
-# Env: GATEWAY [http://localhost:9180], MANAGEMENT [http://localhost:9181],
-#      STABLE_URL [http://stable:8080], CANARY_URL [http://canary:8080] (as the gateway reaches them)
+# Env: GATEWAY [http://localhost:9180], MANAGEMENT [http://localhost:9181] (empty = the management port is
+#      not reachable, as on App Platform: skip the readiness check and the metrics), OPS_USER [ops],
+#      OPS_KEY [local-ops-key], STABLE_URL [http://stable:8080], CANARY_URL [http://canary:8080]
+#      (as the gateway reaches them: the compose service names, which are also the App Platform
+#      component names)
 set -euo pipefail
 
 G="${GATEWAY:-http://localhost:9180}"
-M="${MANAGEMENT:-http://localhost:9181}"
+M="${MANAGEMENT-http://localhost:9181}"
 STABLE="${STABLE_URL:-http://stable:8080}"
 CANARY="${CANARY_URL:-http://canary:8080}"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 json() { python3 -c "import sys, json; print(json.load(sys.stdin)$1)"; }
 
-curl -sf "$M/actuator/health/readiness" >/dev/null || { echo "gateway not ready at $M"; exit 1; }
+# Metrics from the management port, or a note when it is not reachable (MANAGEMENT empty).
+metrics() {
+  if [ -z "$M" ]; then echo "  (metrics skipped: the management port is internal; see the gateway logs)"; return; fi
+  curl -s "$M/actuator/prometheus" | grep -E "$1" | sed 's/^/  /' || true
+}
+
+if [ -n "$M" ]; then
+  curl -sf "$M/actuator/health/readiness" >/dev/null || { echo "gateway not ready at $M"; exit 1; }
+fi
 SESSION=$(curl -sf -X POST "$G/admin/login" -H 'Content-Type: application/json' \
   -d "{\"user\": \"${OPS_USER:-ops}\", \"key\": \"${OPS_KEY:-local-ops-key}\", \"role\": \"admin\"}" | json '["token"]')
 ADMIN=(-H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json')
@@ -64,12 +74,15 @@ for _ in $(seq 200); do
 import sys
 lines = sys.stdin.read().splitlines()
 status = lines[0].split()[1] if lines else "?"
+# App Platform answers an upstream 502/503 as 504 and keeps the original in X-Do-Orig-Status
+orig = next((l.split(":", 1)[1].strip() for l in lines if l.lower().startswith("x-do-orig-status:")), None)
+if orig and orig != status:
+    status = f"{orig}(shown as {status})"
 version = next((l.split(":", 1)[1].strip() for l in lines if l.lower().startswith("x-upstream-version:")), "-")
 print(status, version)'
 done | sort | uniq -c | sort -rn
-curl -s "$M/actuator/prometheus" | grep -E '^gateway_circuit_state\{|^gateway_upstream_fallbacks_total' |
-  sed 's/^/  /' || true
-echo "  (gateway_circuit_state: 0 closed, 1 open, 2 half-open)"
+metrics '^gateway_circuit_state\{|^gateway_upstream_fallbacks_total'
+[ -n "$M" ] && echo "  (gateway_circuit_state: 0 closed, 1 open, 2 half-open)"
 
 step "3. Sticky canary: the same tenant always lands on the same upstream (10 requests)"
 route orders /orders "[{\"url\": \"$STABLE\", \"weight\": 50}, {\"url\": \"$CANARY\", \"weight\": 50}]" ', "sticky": true'
@@ -84,7 +97,7 @@ step "5. Hedging: /random-delay?min=100&max=4000 with hedgeAfterMs 1500 (10 requ
 for _ in $(seq 10); do
   curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' "$G/random-delay?min=100&max=4000" "${AUTH[@]}"
 done | awk '{print "  " $0}'
-curl -s "$M/actuator/prometheus" | grep -E '^gateway_upstream_hedges' | sed 's/^/  /' || true
+metrics '^gateway_upstream_hedges'
 
 step "6. Upstream errors pass through unchanged: /status/418"
 curl -s -w '  HTTP %{http_code}\n' "$G/status/418" "${AUTH[@]}" | sed 's/^/  /'
