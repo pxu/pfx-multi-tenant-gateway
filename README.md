@@ -54,13 +54,24 @@ request produces exactly one audit entry. The full diagram is in
 
 ## Run it
 
+No Docker: everything runs as plain Spring Boot processes (JDK 21 is the only requirement).
+
 ```bash
-docker compose up -d --build   # gateway :8080 (data plane + admin), :8081 (health, metrics), echo upstream
+./scripts/stack.sh demo up     # builds both jars; gateway :8080 (data plane + admin), :8081 (health, metrics),
+                               # echo upstream :9200 (upstream-app)
 ./scripts/demo.sh              # creates a tenant, routes and a token, then shows 200/401/403/400/404/429
+./scripts/stack.sh demo down
 ```
 
-Without Docker: `GATEWAY_OPS_KEY_SHA256=$(printf %s local-ops-key | shasum -a 256 | cut -d' ' -f1) ./mvnw spring-boot:run`
-(JDK 21). Nothing else to run: the config is an embedded H2 database in `./data/`.
+`scripts/stack.sh <demo|upstream-demo|loadtest> <up|down|status>` starts each process with `java -jar`,
+waits until it is healthy, and keeps logs and pid files in `.run/<stack>/` (the gateway's audit lines
+are in `.run/demo/gateway.log`). `SKIP_BUILD=1` reuses the jars.
+
+The gateway alone: `SPRING_PROFILES_ACTIVE=local ./mvnw spring-boot:run` from the repository root.
+Nothing else to run: the config is an embedded H2 database in `./data/`. Profile `local`
+([config/application-local.yml](config/application-local.yml), read from `./config/`, not packaged in
+the jar) allows upstreams on `localhost` and gives operator `ops` the key `local-ops-key`. Without
+the profile, loopback upstreams are refused and `ops` needs `GATEWAY_OPS_KEY_SHA256`.
 
 ## Access control: scopes and RBAC
 
@@ -97,7 +108,7 @@ other admin call. **Tenant users** get their roles through the RBAC API; a token
 user and one of their roles. Tenant tokens are never accepted on the admin API, and
 sessions never on the data plane. A wrong user or key is 401 `ADMIN_UNAUTHORIZED`; a role the user
 does not hold, or an action the role does not allow, is 403 `PERMISSION_DENIED`. Each audit entry
-records `actor` and `role`. In docker compose, operator `ops` (roles `admin`, `viewer`) has the key
+records `actor` and `role`. With profile `local`, operator `ops` (roles `admin`, `viewer`) has the key
 `local-ops-key`.
 
 ### Setup and token issuance
@@ -259,18 +270,20 @@ coverage gate (≥ 80% of lines).
   `RetryBudgetTest` (retries ≈ 10% of requests even when all fail, full-jitter bounds), `CircuitBreakingRateLimiterTest` the breaker and fail-open/closed around it, with a store that can be made to fail.
   `ConfigStoreIT` runs two config stores against one database (propagation, surviving a wiped database, create-or-replace, prefix uniqueness).
 
-CI (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push and builds the Docker image.
+CI (`.github/workflows/ci.yml`) runs `./mvnw verify` on every push, plus the tests of both demo upstreams
+(`./mvnw -f upstream-app/pom.xml verify` and the Go tests).
 
 ## A real upstream (local or on DigitalOcean)
 
-[upstream-app/](upstream-app/README.md) is a small Go service to put behind the gateway: it echoes
+[upstream-app/](upstream-app/README.md) is a small service to put behind the gateway: it echoes
 requests, waits as long as asked (`/delay/{ms}`, `/random-delay?min=&max=`), answers any status code,
-and fails a share of requests on purpose (`FAIL_PCT`). Deployed as two apps on DigitalOcean App
-Platform (a stable one and a canary that fails 60% of requests; `upstream-app/deploy/`), or locally:
+and fails a share of requests on purpose (`FAIL_PCT`). It exists twice with the same behaviour: a
+Spring Boot app (what the local stacks run) and the original Go service. Locally:
 
 ```bash
-docker compose -f upstream-app/docker-compose.yml up -d --build   # gateway :9180, stable :9201, canary :9202
-./scripts/demo-do-upstream.sh          # STABLE_URL / CANARY_URL point it at the apps on DigitalOcean
+./scripts/stack.sh upstream-demo up    # gateway :9180/:9181, stable :9201, canary :9202 (fails 60%)
+./scripts/demo-do-upstream.sh          # STABLE_URL / CANARY_URL point it at apps on DigitalOcean instead
+./scripts/stack.sh upstream-demo down
 ```
 
 The demo shows: the headers the upstream receives (gateway identity headers and `traceparent`, no
@@ -292,18 +305,24 @@ Vegeta step load tests (open model: constant arrival rate), results and analysis
 
 ```bash
 brew install vegeta
-LT_POOL_PER_ROUTE=400 docker compose -f ops/loadtest/docker-compose.yml up -d --build   # ports 9080/9081, upstream 9090
-RATES="4000 8000 12000 16000 20000" ./scripts/loadtest.sh                              # stops at the first step missing the SLO
-docker compose -f ops/loadtest/docker-compose.yml down
+LT_POOL_PER_ROUTE=400 ./scripts/stack.sh loadtest up        # gateway 9080/9081, upstream 9090, slow upstream 9091
+RATES="4000 8000 12000 16000 20000" ./scripts/loadtest.sh   # stops at the first step missing the SLO
+./scripts/stack.sh loadtest down
 ```
 
+The upstreams are the Spring Boot upstream-app in load-test modes (`PLAIN_OK=true`: answers `ok` at once;
+plus `DELAY_MIN_MS=100 DELAY_MAX_MS=5000` for the slow one). The numbers in REPORT.md were measured with
+the earlier Docker kit (nginx upstreams, Docker Desktop), so expect different absolute figures.
+
 The script creates its own tenants, route and tokens, warms up, loads the upstream directly once as a
-baseline, and stops at the first step that misses the SLO (`P99_MS`, `SUCCESS_MIN`). The stack turns off
-the per-address limit (one load generator would otherwise get 20 requests/s). `LT_POOL_PER_ROUTE` sets the
+baseline, and stops at the first step that misses the SLO (`P99_MS`, `SUCCESS_MIN`). The stack (profile `loadtest`,
+[config/application-loadtest.yml](config/application-loadtest.yml)) turns off the per-address limit (one
+load generator would otherwise get 20 requests/s). `LT_POOL_PER_ROUTE` sets the
 upstream pool (default 100 per upstream), and `MAX_CONNECTIONS` caps the load generator's connections so it
 does not run out of local ports itself. For test 2: `LT_POOL_TOTAL`, `LT_TOMCAT_MAX_CONNECTIONS` and
-`LT_JAVA_OPTS` set the pool total, Tomcat's connection limit and JVM flags; the `slow-upstream` service
-(port 9091) delays each response by 100 ms – 5 s, and `TIMEOUT` raises the client's timeout.
+`LT_JAVA_OPTS` set the pool total, Tomcat's connection limit and JVM flags; the slow upstream
+(port 9091; `UPSTREAM=http://localhost:9091`) delays each response by 100 ms – 5 s, and `TIMEOUT` raises
+the client's timeout. `LT_*` variables are read by `stack.sh loadtest up`, so set them there.
 
 ## Security assumptions and known gaps
 

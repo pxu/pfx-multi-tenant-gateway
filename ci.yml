@@ -36,16 +36,24 @@ jobs:
             target/failsafe-reports/
             target/site/jacoco/
 
-  docker:
-    name: Docker image builds
+  upstream-app-java:
+    name: Demo upstream (Spring Boot) tests
     runs-on: ubuntu-latest
-    needs: test
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t multi-tenant-api-gateway:ci .
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and test
+        run: ./mvnw -B -f upstream-app/pom.xml verify
 
   upstream-app:
-    name: Demo upstream (Go) tests and image
+    name: Demo upstream (Go) tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -58,4 +66,3 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race ./...
-      - run: docker build -t gateway-demo-upstream:ci .

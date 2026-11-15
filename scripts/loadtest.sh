@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Step load test with vegeta: how many requests per second the gateway serves within an SLO.
 #
-#   docker compose -f ops/loadtest/docker-compose.yml up -d --build
+#   ./scripts/stack.sh loadtest up            # gateway :9080/:9081, upstream :9090, slow upstream :9091
 #   ./scripts/loadtest.sh
+#   ./scripts/stack.sh loadtest down
 #
 # Open model (constant arrival rate), so a slow gateway cannot hide latency by slowing the load down
 # (coordinated omission). Each step runs DURATION at one rate; the run stops at the first step that
@@ -13,8 +14,8 @@
 #   P99_MS [50]  SUCCESS_MIN [0.999]  TENANTS [4] (tokens rotate across them; one tenant's quota tops
 #   out at 1,000,000/min)  BASELINE [1] (also load the upstream directly at the highest rate)
 #   GATEWAY [http://localhost:9080]  MANAGEMENT [http://localhost:9081]  UPSTREAM [http://localhost:9090]
-#   UPSTREAM_IN_DOCKER [http://upstream:80] (the upstream as the gateway reaches it)
-#   CONTAINER [gateway-loadtest-gateway-1] (for CPU samples; empty = skip)
+#   (the slow upstream: UPSTREAM=http://localhost:9091)
+#   GATEWAY_PID [from .run/loadtest/gateway.pid] (for CPU samples; empty = skip)
 #   TIMEOUT [5s] per request (raise it for a slow upstream)
 #   MAX_CONNECTIONS [2000] caps the load generator's connections: without a cap, a slow step makes vegeta
 #   open thousands of new ones and the client runs out of ephemeral ports (EADDRNOTAVAIL; macOS has ~16k)
@@ -26,14 +27,14 @@ command -v python3 >/dev/null || { echo "python3 not found"; exit 1; }
 G="${GATEWAY:-http://localhost:9080}"
 M="${MANAGEMENT:-http://localhost:9081}"
 UP="${UPSTREAM:-http://localhost:9090}"
-UP_INTERNAL="${UPSTREAM_IN_DOCKER:-http://upstream:80}"
 RATES="${RATES:-500 1000 2000 4000 8000 12000}"
 DURATION="${DURATION:-30s}"
 WARMUP="${WARMUP:-20s}"
 P99_MS="${P99_MS:-50}"
 SUCCESS_MIN="${SUCCESS_MIN:-0.999}"
 TENANTS="${TENANTS:-4}"
-CONTAINER="${CONTAINER-gateway-loadtest-gateway-1}"
+PID_FILE="$(dirname "$0")/../.run/loadtest/gateway.pid"
+GATEWAY_PID="${GATEWAY_PID-$(cat "$PID_FILE" 2>/dev/null || true)}"
 OUT="loadtest-results/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
 
@@ -59,7 +60,7 @@ upsert() {
 }
 
 upsert routes lt "{\"id\": \"lt\", \"pathPrefix\": \"/lt\", \"service\": \"orders\",
-  \"upstreams\": [{\"url\": \"$UP_INTERNAL\", \"weight\": 1}]}"
+  \"upstreams\": [{\"url\": \"$UP\", \"weight\": 1}]}"
 : > "$OUT/targets.txt"
 for i in $(seq "$TENANTS"); do
   t="lt-$i"
@@ -81,8 +82,8 @@ if l.startswith('$1') and not l.startswith('#')))"
 attack() { # name rate duration targets -> results bin, prints a summary row
   local name="$1" rate="$2" duration="$3" targets="$4" cpu="" pool="-"
   ( sleep "$(python3 -c "print($(seconds "$duration") / 2)")"
-    if [ -n "$CONTAINER" ] && command -v docker >/dev/null; then
-      docker stats --no-stream --format '{{.CPUPerc}}' "$CONTAINER" > "$OUT/$name.cpu" 2>/dev/null || true
+    if [ -n "$GATEWAY_PID" ]; then   # the gateway process's CPU (100% = one core)
+      echo "$(ps -o %cpu= -p "$GATEWAY_PID" | tr -d ' ')%" > "$OUT/$name.cpu" 2>/dev/null || true
     fi
     # upstream pool halfway through: leased/pending (pending > 0 = requests waiting for a connection)
     echo "$(metric 'httpcomponents_httpclient_pool_total_connections{httpclient="upstream",state="leased"')/$(metric \
