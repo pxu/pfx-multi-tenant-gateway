@@ -1,10 +1,5 @@
 # Stress test report: requests per second the gateway serves within its SLO
 
-> **Note (kit changed after these runs):** the load-test kit no longer uses Docker. The gateway and the
-> upstreams now run as Spring Boot processes (`./scripts/stack.sh loadtest up`; the upstreams are
-> `upstream-app` with `PLAIN_OK` / `DELAY_MIN_MS`/`DELAY_MAX_MS` instead of nginx). The figures below were
-> measured with the Docker Desktop kit described here and have not been re-measured.
-
 Two tests on one laptop (Apple M4 Max, Docker Desktop VM with 16 CPUs and 8 GB), both with vegeta
 (constant arrival rate) against the gateway at step 32:
 

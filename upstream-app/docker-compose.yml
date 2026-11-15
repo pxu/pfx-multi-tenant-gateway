@@ -1,0 +1,31 @@
+# The gateway with a stable and a canary upstream, to rehearse scripts/demo-do-upstream.sh locally:
+#   docker compose -f upstream-app/docker-compose.yml up -d --build
+#   ./scripts/demo-do-upstream.sh
+# Against the apps on DigitalOcean, start only the gateway and pass their URLs to the demo:
+#   docker compose -f upstream-app/docker-compose.yml up -d --build gateway
+#   STABLE_URL=https://gw-upstream-stable-....ondigitalocean.app CANARY_URL=https://gw-upstream-canary-....ondigitalocean.app \
+#     ./scripts/demo-do-upstream.sh
+name: gateway-do-demo
+services:
+  stable:
+    build: .
+    environment:
+      VERSION: stable
+    ports:
+      - "9201:8080"
+  canary:
+    build: .
+    environment:
+      VERSION: canary
+      FAIL_PCT: "60"
+    ports:
+      - "9202:8080"
+  gateway:
+    build: ..
+    environment:
+      # user "ops" logs in with key "local-ops-key"; local only
+      GATEWAY_OPS_KEY_SHA256: 1d93d8aa6bb02cfaf47c6b57d9c45c7092ab3ae2752bd3549c71afeae9879485
+      GATEWAY_DB_URL: "jdbc:h2:mem:demo;DB_CLOSE_DELAY=-1"
+    ports:
+      - "9180:8080"
+      - "9181:8081"
