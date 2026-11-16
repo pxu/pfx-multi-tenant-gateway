@@ -51,7 +51,7 @@ In the order they are usually built, from the core outwards:
 | 12 | Observability | `X-Request-Id` on every request (sent upstream, returned to the client, in the audit entry); W3C trace context without a library; Prometheus metrics with bounded tags and SLO burn-rate alerts |
 | 13 | Input and SSRF protection | Rejects requests and routes that could trick the gateway: paths that mean something else after decoding (`/orders/../admin`, `%2f`, `;`, control characters) get 400, so the allowlist checks the path the upstream will really see; bodies over 10 MB get 413; a route cannot point at cloud metadata (`169.254.169.254`) or the gateway's own host (loopback) |
 | 14 | Traffic management | Weighted canary (Vose alias, O(1)); sticky canary per tenant (rendezvous hashing) |
-| 15 | Performance | Load-test kit and two stress tests (section 4) |
+| 15 | Performance | Load-test kit and two stress tests (section 5) |
 | 16 | Delivery | Docker demo, a real Go upstream (stable and canary), DigitalOcean App Platform deployment |
 
 ## 2. Data model
@@ -265,7 +265,43 @@ Each layer answers a different question, so a mistake in one is not enough to re
 instance reloads its snapshot at once. Other instances poll the version every 5 s (±20% jitter) and
 swap in a new snapshot when it changes; if the version row is missing they keep the old one.
 
-## 4. Load test
+## 4. Audit log samples
+
+One JSON line per request, written off the request path. These are picked from the 9,007 lines of the
+mixed run in section 6, one per outcome (tenant `mix-a`, user `rita`, role `orders-reader`):
+
+| Request | Status | `reason` | `detail` / upstream | ms |
+|---|---|---|---|---|
+| `GET /mix/items/2` | 200 | – | `http://upstream:80`, 1 upstream span | 2.30 |
+| `GET /mix/items/1`, no token | 401 | `UNAUTHENTICATED` | `auth:MISSING_TOKEN` | 1.71 |
+| `GET /mix/items/1`, forged token | 401 | `UNAUTHENTICATED` | `auth:INVALID_SIGNATURE` | 0.52 |
+| `GET /bill/1` | 403 | `PATH_NOT_ALLOWED` | – | 5.01 |
+| `DELETE /mix/items/1` (a reader) | 403 | `PERMISSION_DENIED` | – | 0.94 |
+| `GET /nope/1` | 404 | `ROUTE_NOT_FOUND` | – | 0.93 |
+| `GET /mix/items/12` | 429 | `RATE_LIMITED` | – | 1.34 |
+| `GET /dead/1` | 502 | `UPSTREAM_ERROR` | `HttpHostConnectException`; `http://upstream:1`, 2 upstream spans (call + retry) | 9.90 |
+| `GET /dead/1` | 503 | `CIRCUIT_OPEN` | `retried after UPSTREAM_ERROR from http://upstream:1`; 1 upstream span | 26.32 |
+| `GET /dead/1` | 503 | `CIRCUIT_OPEN` | – (no upstream call) | 0.76 |
+
+The last three rows show the breaker at work. A refused connection is retried once (two upstream spans)
+and fails with 502. Once the breaker is open, requests to the dead upstream are refused in under 1 ms
+without touching it. When a call fails just as the breaker opens again, its retry is refused by the
+breaker (the 26 ms include the retry's backoff). The two 401s also
+show what the metrics cannot: the same `UNAUTHENTICATED` reason, but `detail` says why.
+
+The full line for the retried request:
+
+```json
+{"requestId": "f999189d-65bf-40fa-b0df-6d47024cfeb5",
+ "traceId": "c43299916e2af3188e76484c3fe88983", "spanId": "95da5e8378768840",
+ "tenantId": "mix-a", "actor": "rita", "role": "orders-reader", "clientIp": "172.64.144.78",
+ "method": "GET", "path": "/dead/1", "routeId": "dead", "upstream": "http://upstream:1",
+ "decision": "DENY", "reason": "CIRCUIT_OPEN",
+ "detail": "retried after UPSTREAM_ERROR from http://upstream:1", "upstreamStatus": null,
+ "upstreamSpans": ["7e6a1901083530c5"], "status": 503, "latencyMs": 26.315083}
+```
+
+## 5. Load test
 
 From [loadtest-results/REPORT.md](../loadtest-results/REPORT.md). Two tests on one laptop (Apple M4 Max,
 Docker Desktop VM with 16 CPUs and 8 GB), both with vegeta (constant arrival rate) against the gateway
@@ -293,7 +329,7 @@ Notes on the table:
 - **Limits:** the load generator, the gateway and the upstream shared one laptop, with no real network
   latency between them, so the numbers are a lower bound and not a capacity plan.
 
-## 5. Metrics from a mixed run
+## 6. Metrics from a mixed run
 
 Scraped from the gateway's Prometheus endpoint (`/actuator/prometheus`) after a 60 s mixed run at
 150 requests/s: allowed requests, every common rejection, and one route whose upstream refuses
@@ -322,7 +358,7 @@ touching the dead upstream.
 Labels are deliberately bounded (`decision`, `reason`, `route`, `status` class): the metric says *how
 many and how fast*, the audit log says *who and exactly why*.
 
-## 6. Deployment topology
+## 7. Deployment topology
 
 The live demo on DigitalOcean App Platform runs **one gateway instance** with the embedded H2 database
 inside its container, plus internal `stable` and `canary` upstreams. H2 is per instance and is reset on
@@ -330,7 +366,7 @@ every deploy, so config propagation across instances (version polling) is covere
 but **not exercised in the live demo**. Running more instances needs a shared database (Postgres or
 MySQL, by URL) and, for exact quotas, a shared rate limiter.
 
-## 7. Known gaps and next steps
+## 8. Known gaps and next steps
 
 | Gap | Effect | Next step |
 |---|---|---|
@@ -341,3 +377,18 @@ MySQL, by URL) and, for exact quotas, a shared rate limiter.
 | DNS rebinding | An upstream host is checked when the route is saved, not when the gateway connects; a name that later resolves to a blocked address is not caught | Check the resolved address at connect time (a custom DNS resolver in the connection pool) |
 | No overall request deadline | Retries are bounded by attempts (2) and timeouts (2 s connect, 10 s response), not by a total budget | A per-request deadline that stops retrying when too little time is left |
 | Config database in the container | Tenants and routes are lost on every redeploy of the demo | A managed Postgres
+
+## 9. Security assumptions
+
+The gateway treats every client, including a tenant with a valid token, as untrusted.
+It relies on the following; the right column says what breaks if one does not hold.
+
+| Assumption | If it does not hold |
+|---|---|
+| **Upstreams are reachable only through the gateway**, so they can trust `X-Tenant-Id`, `X-User-Id` and `X-Role` | A direct caller could claim any tenant or role |
+| **Upstreams ignore method overrides** (`_method` in a form or query) | A reader could turn a `POST` into a delete; the gateway strips override headers but not parameters |
+| **TLS ends at the edge** (App Platform's load balancer) | Tokens and admin sessions could be read in transit |
+| **The signing key stays secret** (secret env var, never in the repo) | Anyone holding it can mint a token for any tenant |
+
+Also assumed: the config database is on a private network and written only by the
+gateway; operators are trusted within their role; clocks are roughly in sync.
