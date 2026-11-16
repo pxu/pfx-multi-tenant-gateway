@@ -112,6 +112,7 @@ public class ConfigStore implements SmartLifecycle {
     private final SingleFlightCache<String, Boolean> revoked;
     private final LongAdder revocationUnavailable = new LongAdder();
     private final CircuitBreaker database;
+    private final boolean revocationFailOpen;
     private final Clock clock;
     /** Set by refresh when the version vanished (the database lost its data): tenant reloads then fail, so stale values are kept. */
     private volatile boolean dataLost;
@@ -121,7 +122,8 @@ public class ConfigStore implements SmartLifecycle {
     @Autowired
     public ConfigStore(ConfigRepository repository, GatewayProperties props, Clock clock, MeterRegistry meters) {
         this(repository, props.configRefreshInterval(), props.tenantCacheTtl(),
-                new CircuitBreaker("config-db", props.configDbCircuitBreaker(), clock).bindTo(meters), clock);
+                new CircuitBreaker("config-db", props.configDbCircuitBreaker(), clock).bindTo(meters),
+                props.revocationFailOpen(), clock);
     }
 
     ConfigStore(ConfigRepository repository, Duration refreshInterval, Duration tenantCacheTtl, Clock clock) {
@@ -130,8 +132,14 @@ public class ConfigStore implements SmartLifecycle {
 
     ConfigStore(ConfigRepository repository, Duration refreshInterval, Duration tenantCacheTtl, CircuitBreaker database,
             Clock clock) {
+        this(repository, refreshInterval, tenantCacheTtl, database, true, clock);
+    }
+
+    ConfigStore(ConfigRepository repository, Duration refreshInterval, Duration tenantCacheTtl, CircuitBreaker database,
+            boolean revocationFailOpen, Clock clock) {
         this.repository = repository;
         this.database = database;
+        this.revocationFailOpen = revocationFailOpen;
         this.refreshMillis = refreshInterval.toMillis();
         this.tenants = new SingleFlightCache<>(tenantCacheTtl, TENANT_CACHE_MAX, clock);
         this.revoked = new SingleFlightCache<>(tenantCacheTtl, TENANT_CACHE_MAX, clock);
@@ -193,11 +201,15 @@ public class ConfigStore implements SmartLifecycle {
      * otherwise one database read shared by every request with that token (single flight). Most
      * answers are "no", and those are cached too.
      *
-     * <p><b>Fails open:</b> if the database is down and this instance has never checked the token, it
-     * counts as not revoked (counted in {@link #revocationUnavailable}). Failing closed would turn a
-     * database outage into 401s for every token not seen before, while routes and cached tenants could
-     * still serve them; a token checked before keeps its last answer (stale if error), so one already
-     * known to be revoked stays revoked.
+     * <p><b>Fails open by default</b> ({@code gateway.revocation-fail-open: true}): if the database is
+     * down (or its breaker open) and this instance has never checked the token, it counts as not revoked
+     * (counted in {@link #revocationUnavailable}). Failing closed would turn a database outage into
+     * rejections for every token not seen before, while routes and cached tenants could still serve them.
+     * With {@code false} such a request gets 503 {@code CONFIG_UNAVAILABLE} instead (a dependency failure,
+     * not a 401: the token may well be valid). Either way a token checked before keeps its last answer
+     * (stale if error), so one already known to be revoked stays revoked.
+     *
+     * <p>A revocation applies at once on the instance that wrote it and within the cache TTL on others.
      */
     public boolean isRevoked(String tokenId) {
         try {
@@ -209,6 +221,14 @@ public class ConfigStore implements SmartLifecycle {
             });
         } catch (RuntimeException e) {
             revocationUnavailable.increment();
+            if (!revocationFailOpen) {
+                if (!(e instanceof DatabaseCircuitOpen)) {
+                    log.warn("revocation of token '{}' could not be checked; rejecting it ({})", tokenId, e.toString());
+                }
+                long retryAfter = database.state() == CircuitBreaker.State.OPEN ? Math.max(1, database.retryAfter().toSeconds()) : 1;
+                throw new GatewayException(ErrorCode.CONFIG_UNAVAILABLE, "token revocation state unavailable",
+                        Map.of("Retry-After", String.valueOf(retryAfter)));
+            }
             if (!(e instanceof DatabaseCircuitOpen)) {
                 log.warn("revocation of token '{}' could not be checked; serving it ({})", tokenId, e.toString());
             }
@@ -222,7 +242,7 @@ public class ConfigStore implements SmartLifecycle {
         revoked.invalidate(tokenId);
     }
 
-    /** Revocation checks that could not reach the database and let the token through (fail open). */
+    /** Revocation checks that could not reach the database (served if fail-open, rejected with 503 if not). */
     public long revocationUnavailable() {
         return revocationUnavailable.sum();
     }

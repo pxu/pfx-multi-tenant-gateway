@@ -764,6 +764,44 @@ class GatewayIT {
     }
 
     @Test
+    void testCircuitBreaker_CanaryBreakerOpenFallbackOff_Rejected503StableNotUsed(CapturedOutput output) throws Exception {
+        // Arrange: as above, but the route turns fallback off
+        WireMockServer stable = newUpstream();
+        WireMockServer canary = newUpstream();
+        stable.stubFor(any(anyUrl()).willReturn(aResponse().withStatus(200).withBody("stable")));
+        canary.stubFor(any(anyUrl()).willReturn(aResponse().withStatus(500)));
+        Fixture f = fixture(List.of("/"), 100_000);
+        Map<String, Object> body = new java.util.HashMap<>(routeBody(f.route, f.prefix,
+                Map.of("http://localhost:" + stable.port(), 1, "http://localhost:" + canary.port(), 9)));
+        body.put("fallback", false);
+        admin("PUT", "/admin/routes/" + f.route, body);
+        for (int i = 0; i < 200 && canary.findAll(anyRequestedFor(anyUrl())).size() < 4; i++) {
+            get(f.prefix + "/x", f.token);
+        }
+        assertThat(canary.findAll(anyRequestedFor(anyUrl()))).hasSize(4);
+        canary.resetRequests();
+        stable.resetRequests();
+
+        // Act: ~9 in 10 of these pick the canary by weight
+        List<HttpResponse<String>> responses = new java.util.ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            responses.add(get(f.prefix + "/x", f.token));
+        }
+
+        // Assert: those picking the canary got 503 CIRCUIT_OPEN instead of moving to stable
+        List<HttpResponse<String>> rejected = responses.stream().filter(r -> r.statusCode() == 503).toList();
+        assertThat(rejected).isNotEmpty();
+        assertThat(rejected).allSatisfy(r -> {
+            assertThat(r.body()).contains("CIRCUIT_OPEN");
+            assertThat(r.headers().firstValue("Retry-After")).isPresent();
+            assertThat(audit(output, r).path("detail").asText())
+                    .isEqualTo("breaker-open:http://localhost:" + canary.port() + " (no fallback)");
+        });
+        assertThat(stable.findAll(anyRequestedFor(anyUrl()))).hasSize(responses.size() - rejected.size());
+        assertThat(canary.findAll(anyRequestedFor(anyUrl()))).isEmpty();
+    }
+
+    @Test
     void testAdmin_RouteToCloudMetadataAddress_Rejected400() throws Exception {
         HttpResponse<String> response = admin("POST", "/admin/routes",
                 routeBody("r" + IDS.incrementAndGet(), "/meta" + IDS.incrementAndGet(), "http://169.254.169.254"));

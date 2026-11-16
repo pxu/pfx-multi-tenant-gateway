@@ -68,6 +68,7 @@ gateway:
   trusted-proxies: []          # load balancers whose X-Forwarded-For is believed (IPs or CIDRs); none = TCP peer only
   continue-client-traces: true # join the client's W3C traceparent; false = every request starts a new trace here
   rate-limit-fail-open: true   # rate limiter failing (or its breaker open): serve without limits (true) or 503 (false)
+  revocation-fail-open: true   # revocation state unreadable (config DB down, token never checked here): serve (true) or 503 (false)
   config-refresh-interval: 5s  # max delay before a change made through another instance applies here
   tenant-cache-ttl: 5s         # tenants load on demand (single flight); cached this long per instance
   upstream-timeout: 10s

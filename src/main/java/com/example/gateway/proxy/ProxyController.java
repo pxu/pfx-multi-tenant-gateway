@@ -416,7 +416,8 @@ public class ProxyController {
      * The picked upstream if its breaker admits the call. Otherwise the route's other upstreams, heaviest
      * first, until one admits it: with stable 90 / canary 10, a failing canary sends everything to stable.
      * Upstreams on the same host:port share one breaker, so each breaker is asked once. All open: 503 with
-     * the soonest time any of them will try again.
+     * the soonest time any of them will try again. A route with {@code "fallback": false} answers 503
+     * at once instead of moving the request to another upstream.
      */
     private Admitted admit(Route route, Route.Upstream picked, AuditRecord audit) {
         CircuitBreaker first = breaker(picked.url());
@@ -425,6 +426,12 @@ public class ProxyController {
             return new Admitted(picked.url(), permit.get());
         }
         Duration soonest = first.retryAfter();
+        if (!route.fallback()) {
+            audit.detail("breaker-open:" + upstreamKey(picked.url()) + " (no fallback)");
+            throw new GatewayException(ErrorCode.CIRCUIT_OPEN,
+                    "upstream for route '" + route.id() + "' is temporarily unavailable",
+                    Map.of("Retry-After", String.valueOf(Math.max(1, soonest.toSeconds()))));
+        }
         Set<String> asked = new HashSet<>(Set.of(upstreamKey(picked.url())));
         List<Route.Upstream> heaviestFirst = route.upstreams().stream()
                 .sorted(Comparator.comparingInt(Route.Upstream::weight).reversed())

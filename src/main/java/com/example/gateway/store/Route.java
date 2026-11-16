@@ -25,6 +25,10 @@ import java.util.List;
  * @param requestsPerMinute limit for the route as a whole, all tenants together (the service owner's
  *                  protection for the upstream); 0 (default) = none
  * @param burst     requests the route takes at once (≤ requestsPerMinute); 0 = one second's worth
+ * @param fallback  when the picked upstream's circuit breaker is open, send the request to another
+ *                  upstream of the route whose breaker admits it (default true: availability first).
+ *                  {@code false} answers 503 instead, so an outage of stable never sends all traffic to
+ *                  a canary that was meant to take 10%, and a sticky tenant never changes version
  */
 public record Route(
         @Pattern(regexp = Route.ID) String id,
@@ -34,7 +38,8 @@ public record Route(
         boolean sticky,
         @PositiveOrZero @Max(60_000) int hedgeAfterMs,
         @PositiveOrZero int requestsPerMinute,
-        @PositiveOrZero int burst) {
+        @PositiveOrZero int burst,
+        Boolean fallback) {
 
     public static final String ID = "^[a-z0-9][a-z0-9-]{0,62}$";
 
@@ -44,6 +49,13 @@ public record Route(
 
     public Route {
         upstreams = upstreams == null ? List.of() : List.copyOf(upstreams);
+        fallback = fallback == null ? Boolean.TRUE : fallback; // absent in JSON written before it existed
+    }
+
+    /** Fallback on, like every route before the setting existed. */
+    public Route(String id, String pathPrefix, List<Upstream> upstreams, String service, boolean sticky, int hedgeAfterMs,
+            int requestsPerMinute, int burst) {
+        this(id, pathPrefix, upstreams, service, sticky, hedgeAfterMs, requestsPerMinute, burst, true);
     }
 
     /** Not sticky, no hedging, no route limit. */
@@ -63,6 +75,6 @@ public record Route(
     }
 
     public Route withId(String newId) {
-        return new Route(newId, pathPrefix, upstreams, service, sticky, hedgeAfterMs, requestsPerMinute, burst);
+        return new Route(newId, pathPrefix, upstreams, service, sticky, hedgeAfterMs, requestsPerMinute, burst, fallback);
     }
 }
