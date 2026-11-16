@@ -42,10 +42,10 @@ In the order they are usually built, from the core outwards:
 | 3 | Authentication | RS256 tenant JWTs verified locally (no I/O); admin login with one active role; token revocation by `jti` |
 | 4 | Authorization | Path allowlist and scopes per tenant; RBAC (user → roles → permissions) as one module for both the admin API and the data plane; custom roles cannot escalate |
 | 5 | Audit and errors | Exactly one audit entry per request (async queue); every rejection is a thrown exception rendered once as RFC 9457 problem+json |
-| 6 | Rate limiting | Token buckets (rate + burst) behind a `RateLimiter` interface: per IP before auth, then per user, per tenant, per route; checked last so rejected requests spend no quota |
+| 6 | Rate limiting | Token buckets (rate + burst) behind a `RateLimiter` interface: per IP before auth, then per user, per tenant, per route; checked last so rejected requests spend no quota. Buckets are in each instance's memory; a breaker with fail-open/closed wraps the interface for when a shared store (Redis) replaces it |
 | 7 | Configuration store | Tenants, routes and RBAC in a JDBC database (portable SQL, H2 default), served from an immutable in-memory snapshot; instances reload when a version row changes |
 | 8 | SingleFlight cache | Tenant and token-revocation lookups are cached for 5 s; when many requests miss the same key at once, only one reads the database and the rest wait for its result. Unknown tenants are cached too, failures are not, and a failed reload keeps serving the last good value |
-| 9 | Resilience | Circuit breaker per upstream, with fallback to a healthy upstream of the route (per-route `fallback`, on by default); bulkhead per tenant; retries with full-jitter backoff and a retry budget; hedging for slow idempotent calls, which also spends the retry budget and needs the target's breaker to admit it (the slower call is cancelled); fail-open limiter |
+| 9 | Resilience | Circuit breaker per upstream, with fallback to a healthy upstream of the route (per-route `fallback`, on by default); bulkhead per tenant; retries with full-jitter backoff and a retry budget; hedging for slow idempotent calls, which also spends the retry budget and needs the target's breaker to admit it (the slower call is cancelled). Retries and hedges apply only to GET/HEAD/OPTIONS without a body, so no body is ever buffered for replay |
 | 10 | Load-spike protection | Instances poll the config version on a jittered interval (±20%) so they never hit the database together; a breaker around config-database reads fails fast during an outage instead of every cache miss waiting on a timeout; 429 and 503 responses carry `Retry-After` so clients know when to come back |
 | 11 | Upstream connection pool | Pooled, reused connections to upstreams (HttpClient 5) with limits per upstream and in total; idle connections are kept long enough to be reused, so heavy traffic does not run out of local ports; a request waits briefly for a free connection, then gets 503 |
 | 12 | Observability | `X-Request-Id` on every request (sent upstream, returned to the client, in the audit entry); W3C trace context without a library; Prometheus metrics with bounded tags and SLO burn-rate alerts |
@@ -56,8 +56,9 @@ In the order they are usually built, from the core outwards:
 
 ## 2. Data model
 
-Relational schema of the configuration database (the source of truth; every instance serves it from
-an in-memory snapshot):
+**Target schema.** The normalised design below; section 2.1 shows what the code implements today.
+The configuration database is the source of truth, and every instance serves it from an in-memory
+snapshot.
 
 **Tenants, users and RBAC**
 
@@ -167,9 +168,21 @@ tenant; they and their roles are configured outside these tables.
 | `revoked_tokens` | Revoked token ids, kept until the token would have expired anyway |
 | `config_version` | One row; a new UUID in the same transaction as every write tells other instances to reload |
 
-The current code (`schema-h2.sql`) implements a simpler form: lists are stored in one text column as
-the admin API's JSON (portable across H2, Postgres and MySQL); memberships and their roles are one
-table, `role_assignments` (tenant, user → roles), with no separate `users` table. The admin API bodies:
+### 2.1 Implemented schema (`schema-h2.sql`)
+
+| Table | Columns | Holds |
+|---|---|---|
+| `tenants` | `id` PK, `data` text | the tenant as JSON (quotas, allowed paths, scopes) |
+| `routes` | `id` PK, `path_prefix` UNIQUE, `data` text | the route as JSON (upstreams and weights, service, sticky, hedging, limits, fallback) |
+| `roles` | `name` PK, `permissions` text | custom roles only (built-in roles are in `application.yml`) |
+| `role_assignments` | `tenant_id` + `user_id` PK, `roles` text; FK → `tenants` ON DELETE CASCADE | a tenant user's roles (membership and roles in one row) |
+| `revoked_tokens` | `jti` PK, `expires_at` | as in the target schema |
+| `config_version` | `id` PK, `version` | as in the target schema |
+
+Why simpler: lists are stored as the admin API's JSON in one text column, so the same SQL (no vendor
+upserts, no JSON column types) runs unchanged on H2, Postgres and MySQL, and a record is read and written
+whole. The cost: no foreign keys or indexes inside the lists, and no global `users` table (a user id is
+only meaningful within its tenant). The admin API bodies:
 
 ```json
 // PUT /admin/tenants/acme
@@ -235,6 +248,17 @@ the route (this is what the canary demo shows); a route with `"fallback": false`
 trading availability for never putting a canary under full load; a hedged route sends a second copy after
 `hedgeAfterMs` and takes the first answer.
 
+### Three authorization layers
+
+Each layer answers a different question, so a mistake in one is not enough to reach a service:
+
+- **Path allowlist** (per tenant): which paths this tenant may call at all.
+- **Scopes** (in the token, within what the tenant may grant): which services this token may name.
+- **RBAC** (role → permissions): which actions (`orders:read`, `orders:delete`, by HTTP method) the
+  token's role may perform. On every request the gateway also checks that the user still holds that
+  role (from the in-memory snapshot), so removing a role takes effect at the next config reload, not at
+  token expiry.
+
 ### A config change
 
 `PUT /admin/routes/{id}` writes the data and a new `config_version` in one transaction, and the
@@ -255,3 +279,65 @@ at step 32:
 | What it took | pool 400 per upstream; client capped at 2,000 connections | pool 20,000; Tomcat `max-connections` 20,000; load generated inside the Docker network |
 | What stopped it next | not reached | memory: ~145 KB live per request in flight, mostly Tomcat and HttpClient buffers, on a VM already near its 8 GB |
 | Code changed | no | no (configuration only; two GC alternatives were tried and were worse) |
+
+Notes on the table:
+
+- **Test 1, "breaker window":** the breaker judges the last 20 calls. At 8,000 requests/s that is about
+  2.5 ms of traffic, so a short burst of pool timeouts opened the breaker for 10 s on a healthy upstream,
+  and most failed requests got 503 `CIRCUIT_OPEN`. A time-based window would judge on more evidence.
+- **Test 2, "20 requests/s":** Little's law gives 100 connections ÷ 2.55 s ≈ 39 requests/s. The run
+  tested only 20 and 40 requests/s: 20 passed, and 40 needed about 102 connections and failed. So 20 is
+  the highest rate that passed, and the limit lies between 20 and 39.
+- **Next optimisation:** most of the ~145 KB per request in flight is Tomcat and HttpClient I/O buffers;
+  smaller buffers could cut it, at the cost of more system calls for large bodies. Not measured yet.
+- **Limits:** the load generator, the gateway and the upstream shared one laptop, with no real network
+  latency between them, so the numbers are a lower bound and not a capacity plan.
+
+## 5. Metrics from a mixed run
+
+Scraped from the gateway's Prometheus endpoint (`/actuator/prometheus`) after a 60 s mixed run at
+150 requests/s: allowed requests, every common rejection, and one route whose upstream refuses
+connections. Load-test and admin calls are excluded. Each chart shows the PromQL that would draw it
+in Grafana.
+
+![Summary and circuit breakers](images/metrics-summary.png)
+
+![Requests by decision and reason](images/metrics-by-reason.png)
+
+![Latency per outcome](images/metrics-latency.png)
+
+Every rejection costs about 0.5 ms at p50, the same as a served request, because each check runs in
+memory before any upstream call. `CIRCUIT_OPEN` fails fast too: the open breaker answers without
+touching the dead upstream.
+
+**Metrics vs audit log**
+
+| Question | Prometheus metric | Audit log |
+|---|---|---|
+| Success / failure rate, trends, alerts | ✅ cheap, aggregated over all instances | possible, but needs a log search |
+| Exact status code (401 vs 403) | status class only (`4xx`), plus `reason` | ✅ exact `status` |
+| Why auth failed (missing token vs bad signature) | ❌ only `UNAUTHENTICATED` | ✅ `detail: auth:MISSING_TOKEN` |
+| Which tenant / user / path | ❌ never a label (unbounded cardinality) | ✅ `tenantId`, `actor`, `path`, `requestId` |
+
+Labels are deliberately bounded (`decision`, `reason`, `route`, `status` class): the metric says *how
+many and how fast*, the audit log says *who and exactly why*.
+
+## 6. Deployment topology
+
+The live demo on DigitalOcean App Platform runs **one gateway instance** with the embedded H2 database
+inside its container, plus internal `stable` and `canary` upstreams. H2 is per instance and is reset on
+every deploy, so config propagation across instances (version polling) is covered by integration tests
+but **not exercised in the live demo**. Running more instances needs a shared database (Postgres or
+MySQL, by URL) and, for exact quotas, a shared rate limiter.
+
+## 7. Known gaps and next steps
+
+| Gap | Effect | Next step |
+|---|---|---|
+| Rate limits and bulkhead are per instance | With N instances a tenant gets up to N × its quota and N × its concurrent requests | A Redis implementation of `RateLimiter` (atomic check-and-consume in Lua, keys hash-tagged per tenant, fail-open/closed by setting) |
+| Client address behind App Platform's edge | `gateway.trusted-proxies` is empty there, so the per-IP limit sees the edge's addresses: one busy machine can hit 429 above about 20 requests/s | Set `trusted-proxies` to the edge's address ranges (TODO: verify which ranges App Platform uses) |
+| Token revocation is cached and fails open | A revoked token can work for up to 5 s on another instance; while the config database is down, a token never checked on an instance is served | `gateway.revocation-fail-open: false` rejects with 503 instead; revocations could be pushed into the snapshot |
+| Breaker fallback can move all traffic to the canary | With stable's breaker open, a 90/10 route sends everything to the canary, and sticky tenants switch version | Per route, `"fallback": false` answers 503 instead (availability vs. exposing an unvalidated version) |
+| DNS rebinding | An upstream host is checked when the route is saved, not when the gateway connects; a name that later resolves to a blocked address is not caught | Check the resolved address at connect time (a custom DNS resolver in the connection pool) |
+| No overall request deadline | Retries are bounded by attempts (2) and timeouts (2 s connect, 10 s response), not by a total budget | A per-request deadline that stops retrying when too little time is left |
+| Config database in the container | Tenants and routes are lost on every redeploy of the demo | A managed Postgres
