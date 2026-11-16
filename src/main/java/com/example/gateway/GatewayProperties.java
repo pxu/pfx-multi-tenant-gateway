@@ -19,6 +19,8 @@ import org.springframework.util.unit.DataSize;
  * @param continueClientTraces join a valid W3C {@code traceparent} sent by the client (true), or always
  *                          start a new trace at the gateway (an edge that does not trust callers' trace ids)
  * @param rateLimitFailOpen when the rate limiter fails (or its breaker is open): serve without limits (true) or reject with 503
+ * @param revocationFailOpen when a token's revocation state cannot be read (config database down, never cached here):
+ *                          serve the token (true) or reject the request with 503 {@code CONFIG_UNAVAILABLE} (false)
  * @param configRefreshInterval how often each instance checks the config database for changes written via other instances
  * @param tenantCacheTtl    how long a tenant loaded on demand is kept in memory (= how long a change made
  *                          through another instance takes to apply here)
@@ -41,6 +43,7 @@ public record GatewayProperties(
         List<String> trustedProxies,
         boolean continueClientTraces,
         boolean rateLimitFailOpen,
+        boolean revocationFailOpen,
         Duration configRefreshInterval,
         Duration tenantCacheTtl,
         Duration upstreamTimeout,

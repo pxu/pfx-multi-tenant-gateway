@@ -231,6 +231,7 @@ comments. Environment variables:
 | `gateway.ip-rate-limit` (yml) | 1200/min, burst 100 | Per client address, before authentication; `requests-per-minute: 0` turns it off |
 | `gateway.trusted-proxies` (yml) | none | Load balancers (IPs or CIDRs) whose `X-Forwarded-For` is believed (empty on App Platform for now: see known gaps) |
 | `gateway.continue-client-traces` (yml) | true | Join a valid client `traceparent`; `false` = every request starts a new trace at the gateway |
+| `gateway.revocation-fail-open` (yml) | true | A token whose revocation state cannot be read (config database down, token never checked on this instance) is served (`true`) or rejected with 503 `CONFIG_UNAVAILABLE` (`false`); a token checked before keeps its last answer either way |
 | `gateway.config-db-circuit-breaker` (yml) | 50% of the last 10 reads (at least 5), open 5s | Breaker around the database reads on the request path (tenants, token revocations); `spring.datasource.hikari.connection-timeout` (2000 ms, Hikari's default is 30 s) bounds each read before it opens |
 | `GATEWAY_DB_URL` | `jdbc:h2:file:./data/gateway` | Config database; any JDBC URL (add the driver) |
 | `GATEWAY_DB_USER`, `GATEWAY_DB_PASSWORD` | `sa`, empty | Its credentials |
@@ -427,7 +428,7 @@ answered 429):
 
 | Gap | Impact | Next step |
 |---|---|---|
-| Token revocation fails open, and lives in the config database | While the database is down, a revoked token an instance has never checked is served (counted, alerted); a database that loses its data forgets its revocations | Fail closed per tenant (a setting), or replicate revocations into the snapshot; backups |
+| Token revocation fails open by default, and lives in the config database | While the database is down, a revoked token an instance has never checked is served (counted, alerted); a database that loses its data forgets its revocations | `gateway.revocation-fail-open: false` rejects such tokens with 503 instead (gateway-wide); per tenant, or revocations replicated into the snapshot; backups |
 | Spans are identified, not exported | Trace and span ids reach upstreams and the audit log, but no span (with timings) is sent to a collector; new traces are always sampled | The OpenTelemetry SDK with an OTLP exporter and a ratio sampler (needs dependency approval); the ids stay the same |
 | Until the `config-db` breaker opens, reads wait for the database | The first few requests that miss the cache during an outage each wait up to the connection timeout (2s) before failing; after that they fail at once | Lower timeouts, or a health probe that opens the breaker before requests see the outage |
 | Config propagates by polling | A change made through another instance (sharing one database) applies within ~5s | Push invalidation (Postgres `LISTEN/NOTIFY`), polling kept as a safety net |
