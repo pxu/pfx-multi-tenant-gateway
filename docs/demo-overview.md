@@ -45,7 +45,7 @@ In the order they are usually built, from the core outwards:
 | 6 | Rate limiting | Token buckets (rate + burst) behind a `RateLimiter` interface: per IP before auth, then per user, per tenant, per route; checked last so rejected requests spend no quota |
 | 7 | Configuration store | Tenants, routes and RBAC in a JDBC database (portable SQL, H2 default), served from an immutable in-memory snapshot; instances reload when a version row changes |
 | 8 | SingleFlight cache | Tenant and token-revocation lookups are cached for 5 s; when many requests miss the same key at once, only one reads the database and the rest wait for its result. Unknown tenants are cached too, failures are not, and a failed reload keeps serving the last good value |
-| 9 | Resilience | Circuit breaker per upstream with fallback to a healthy one; bulkhead per tenant; retries with full-jitter backoff and a retry budget; hedging for slow idempotent calls, which also spends the retry budget and needs the target's breaker to admit it (the slower call is cancelled); fail-open limiter |
+| 9 | Resilience | Circuit breaker per upstream, with fallback to a healthy upstream of the route (per-route `fallback`, on by default); bulkhead per tenant; retries with full-jitter backoff and a retry budget; hedging for slow idempotent calls, which also spends the retry budget and needs the target's breaker to admit it (the slower call is cancelled); fail-open limiter |
 | 10 | Load-spike protection | Instances poll the config version on a jittered interval (±20%) so they never hit the database together; a breaker around config-database reads fails fast during an outage instead of every cache miss waiting on a timeout; 429 and 503 responses carry `Retry-After` so clients know when to come back |
 | 11 | Upstream connection pool | Pooled, reused connections to upstreams (HttpClient 5) with limits per upstream and in total; idle connections are kept long enough to be reused, so heavy traffic does not run out of local ports; a request waits briefly for a free connection, then gets 503 |
 | 12 | Observability | `X-Request-Id` on every request (sent upstream, returned to the client, in the audit entry); W3C trace context without a library; Prometheus metrics with bounded tags and SLO burn-rate alerts |
@@ -131,6 +131,7 @@ erDiagram
       int hedge_after_ms
       int requests_per_minute
       int burst
+      boolean fallback
     }
     ROUTE_UPSTREAMS {
       varchar route_id PK,FK
@@ -183,7 +184,7 @@ table, `role_assignments` (tenant, user → roles), with no separate `users` tab
 // PUT /admin/routes/orders
 {
   "id": "orders", "pathPrefix": "/orders", "service": "orders",
-  "sticky": false, "hedgeAfterMs": 0, "requestsPerMinute": 0, "burst": 0,
+  "sticky": false, "hedgeAfterMs": 0, "requestsPerMinute": 0, "burst": 0, "fallback": true,
   "upstreams": [
     { "url": "http://stable:8080", "weight": 90 },
     { "url": "http://canary:8080", "weight": 10 }
@@ -230,7 +231,8 @@ sequenceDiagram
 | Upstream connect error / timeout | 502 / 504 (idempotent requests retried within a retry budget) |
 
 **Resilience:** if the picked upstream's breaker is open, the gateway falls back to another upstream on
-the route (this is what the canary demo shows); a hedged route sends a second copy after
+the route (this is what the canary demo shows); a route with `"fallback": false` answers 503 instead,
+trading availability for never putting a canary under full load; a hedged route sends a second copy after
 `hedgeAfterMs` and takes the first answer.
 
 ### A config change
